@@ -469,8 +469,8 @@ def select_pipeline_segment(
 
 
 def get_layer_maps_from_layer_type_list(
-    layer_type_list: List[str],
-) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int]]:
+    layer_type_list: list[str],
+) -> list[dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
     for each layer type in [Mamba, GDN, Attention, MLP, MoE] given a layer type list.
