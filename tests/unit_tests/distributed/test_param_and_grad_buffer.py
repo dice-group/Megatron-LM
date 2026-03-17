@@ -47,13 +47,21 @@ def get_model_and_buffers(
     # Wrap with DistributedDataParallel, and get underlying buffer.
     # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
     # errors for num_attention_heads and num_layers.
-    # Pass the optimizer class so the buffer uses the correct layout for dist optimizer.
-    optimizer_class = DistributedOptimizer if use_distributed_optimizer else None
+    # Pre-compute parameter layouts for the distributed optimizer.
+    param_layout_map = None
+    if use_distributed_optimizer:
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        param_layout_map = DistributedOptimizer.compute_param_layouts(
+            all_params,
+            bucket_size,
+            parallel_state.get_data_parallel_world_size(),
+            ddp_config,
+        )
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1),
         ddp_config=ddp_config,
         module=model,
-        optimizer_class=optimizer_class,
+        param_layout_map=param_layout_map,
     )
     assert len(model.buffers) == 1
     param_and_grad_buffer = model.buffers[0]

@@ -15,6 +15,7 @@ from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from .param_layout import ParamLayoutMap, group_params_by_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,9 @@ class DistributedDataParallel(_BaseDataParallel):
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
         pg_collection: Optional unified process group for distributed training.
-        optimizer_class: Optional optimizer class with a `compute_param_layout` classmethod.
-            When provided, the buffer delegates parameter layout computation to this class.
+        param_layout_map: Optional ParamLayoutMap providing pre-computed layouts for all
+            dtype groups. When provided, each buffer uses the corresponding ParamLayout
+            instead of computing a default one.
 
     """
 
@@ -47,7 +49,7 @@ class DistributedDataParallel(_BaseDataParallel):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        optimizer_class: Optional[type] = None,
+        param_layout_map: Optional[ParamLayoutMap] = None,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -130,49 +132,9 @@ class DistributedDataParallel(_BaseDataParallel):
         def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
         ):
-            param_and_grad_dtype_to_params = {}
-            param_and_grad_dtype_to_offsets = {}
-            param_and_grad_dtype_to_indices = {}
-
-            # Group parameters by their gradient type.
-            for param in input_params:
-                assert param.requires_grad
-
-                param_dtype = param.dtype
-                if is_float8tensor(param):
-                    # Currently TE's Float8Tensor is a wrapper of torch.Tensor. It has a "fake"
-                    # dtype (usually a higher precision dtype such as bfloat16), but its actual
-                    # data is stored in the form of a torch uint8 tensor within the Float8Tensor's
-                    # ".data" attribute. Therefore, when creating the param buffer for fp8 params,
-                    # it is necessary to use torch.uint8, not the "fake" dtype got from
-                    # "param.dtype".
-                    param_dtype = torch.uint8
-                grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
-
-                params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
-                params.append(param)
-                param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
-
-                # Get the index of each param among the params with same dtype, if a param is fp8,
-                # use its "fake" high precision dtype to find which params have same dtype with it.
-                # For example:
-                #     Case 1:
-                #         params = [p1(bf16), p2(bf16), p3(bf16), p4(bf16)]
-                #         param_and_grad_dtype_to_indices = {
-                #             (torch.bfloat16, torch.float32): [0, 1, 2, 3],
-                #         }
-                #     Case 2:
-                #         params = [p1(bf16), p2(fp8), p3(fp8), p4(bf16)]
-                #         param_and_grad_dtype_to_indices = {
-                #             (torch.bfloat16, torch.float32): [0, 3],
-                #             (torch.uint8, torch.float32): [1, 2],
-                #         }
-                # We need these indices to load a non-native-fp8 checkpoint in native-fp8 mode.
-                offset = param_and_grad_dtype_to_offsets.get((param.dtype, grad_dtype), 0)
-                param_and_grad_dtype_to_offsets[(param.dtype, grad_dtype)] = offset + 1
-                indices = param_and_grad_dtype_to_indices.get((param_dtype, grad_dtype), [])
-                indices.append(offset)
-                param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)] = indices
+            dtype_groups = group_params_by_dtype(
+                input_params, self.ddp_config.grad_reduce_in_fp32
+            )
 
             if not config.calculate_per_token_loss:
                 target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
@@ -198,7 +160,12 @@ class DistributedDataParallel(_BaseDataParallel):
             pg_collection = ProcessGroupCollection()
             pg_collection.tp = self.tp_group
             pg_collection.dp_cp = self.dp_cp_group
-            for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
+            for (param_dtype, grad_dtype), (params, param_indices) in dtype_groups.items():
+                param_layout = (
+                    param_layout_map.layouts.get((param_dtype, grad_dtype))
+                    if param_layout_map is not None
+                    else None
+                )
                 buffers.append(
                     _ParamAndGradBuffer(
                         self.ddp_config,
@@ -209,10 +176,10 @@ class DistributedDataParallel(_BaseDataParallel):
                         self.bucket_size,
                         param_to_name,
                         gradient_scaling_factor,
-                        param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
+                        param_indices,
                         self.ddp_config.nccl_ub,
                         pg_collection,
-                        optimizer_class=optimizer_class,
+                        param_layout=param_layout,
                     )
                 )
 

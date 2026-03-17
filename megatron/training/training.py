@@ -1386,23 +1386,46 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 ddp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
                 ddp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
 
-            # Pass the optimizer class to DDP so it can delegate parameter layout
-            # computation. This avoids baking optimizer-specific layout assumptions
-            # (padding, bucket splitting) into the buffer.
-            if args.use_distributed_optimizer:
-                dp_init_kwargs["optimizer_class"] = DistributedOptimizer
-            model = [
-                DP(
-                    config=config,
-                    ddp_config=ddp_config,
-                    module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication
-                    # for these model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **ddp_init_kwargs,
+            wrapped_model = []
+            for model_chunk_idx, model_chunk in enumerate(model):
+                chunk_kwargs = dict(ddp_init_kwargs)
+                disable_bucketing = (
+                    (model_chunk_idx > 0)
+                    or args.overlap_param_gather_with_optimizer_step
                 )
-                for (model_chunk_idx, model_chunk) in enumerate(model)
-            ]
+
+                # Pre-compute parameter layouts for the distributed optimizer.
+                if args.use_distributed_optimizer:
+                    all_params = [
+                        p for p in model_chunk.parameters() if p.requires_grad
+                    ]
+                    # Use the same effective bucket_size that DDP will use.
+                    # DDP also disables bucketing for pp_rank > 0.
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    effective_bucket_size = (
+                        None
+                        if disable_bucketing or pp_rank > 0
+                        else ddp_config.bucket_size
+                    )
+                    chunk_kwargs["param_layout_map"] = (
+                        DistributedOptimizer.compute_param_layouts(
+                            all_params,
+                            effective_bucket_size,
+                            mpu.get_data_parallel_world_size(with_context_parallel=True),
+                            ddp_config,
+                        )
+                    )
+
+                wrapped_model.append(
+                    DP(
+                        config=config,
+                        ddp_config=ddp_config,
+                        module=model_chunk,
+                        disable_bucketing=disable_bucketing,
+                        **chunk_kwargs,
+                    )
+                )
+            model = wrapped_model
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)

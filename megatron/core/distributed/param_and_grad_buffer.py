@@ -5,10 +5,9 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -28,6 +27,7 @@ from ..fp8_utils import (
 )
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .param_layout import ParamLayout, default_param_layout
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
@@ -728,76 +728,6 @@ class _ParamAndGradBucketGroup:
                     self.start_grad_sync(force_all_reduce=force_all_reduce)
 
 
-@dataclass
-class ParamLayout:
-    """Output of a parameter layout computation.
-
-    Describes how parameters should be laid out in the contiguous buffer.
-
-    Attributes:
-        param_index_map: Mapping from parameter to (start_index, end_index, bucket_id) in buffer.
-        bucket_indices: List of (start_index, end_index) for each bucket.
-        per_bucket_numel_unpadded: Number of unpadded elements per bucket.
-    """
-
-    param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
-    bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
-    per_bucket_numel_unpadded: List[int] = field(default_factory=list)
-
-
-def _default_param_layout(
-    params: List[torch.nn.Parameter],
-    bucket_size: Optional[int],
-) -> ParamLayout:
-    """Compute parameter layout for the non-distributed-optimizer case.
-
-    No padding is applied. Parameters are iterated in reverse order (backprop order)
-    and grouped into buckets of approximately `bucket_size` elements.
-
-    Args:
-        params: List of parameters to lay out.
-        bucket_size: Approximate number of elements per bucket, or None for a single bucket.
-
-    Returns:
-        ParamLayout with the computed mapping.
-    """
-    param_index_map = {}
-    bucket_indices = []
-    per_bucket_numel_unpadded = []
-
-    param_start_index = 0
-    bucket_start_index = 0
-    bucket_params = set()
-    bucket_id = 0
-
-    for param in params[::-1]:
-        this_numel = param.data.nelement()
-        param_end_index = param_start_index + this_numel
-        param_index_map[param] = (param_start_index, param_end_index, bucket_id)
-        bucket_params.add(param)
-
-        if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
-            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
-            bucket_indices.append((bucket_start_index, param_end_index))
-            bucket_start_index = param_end_index
-            bucket_params = set()
-            bucket_id += 1
-            param_start_index = param_end_index
-        else:
-            param_start_index = param_end_index
-
-    # Add remaining params to a new bucket.
-    if len(bucket_params) > 0:
-        per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
-        bucket_indices.append((bucket_start_index, param_end_index))
-
-    return ParamLayout(
-        param_index_map=param_index_map,
-        bucket_indices=bucket_indices,
-        per_bucket_numel_unpadded=per_bucket_numel_unpadded,
-    )
-
-
 class _ParamAndGradBuffer:
     """
     Groups parameters and gradients into a contiguous buffer, and then breaks the buffer into
@@ -833,7 +763,7 @@ class _ParamAndGradBuffer:
         param_indices: List[int],
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        optimizer_class: Optional[type] = None,
+        param_layout: Optional[ParamLayout] = None,
     ):
 
         if pg_collection is None:
@@ -869,17 +799,12 @@ class _ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
 
-        # Delegate layout computation to the optimizer class if provided,
-        # otherwise use the default (no-padding) layout.
-        if optimizer_class is not None and hasattr(optimizer_class, 'compute_param_layout'):
-            layout = optimizer_class.compute_param_layout(
-                params, bucket_size, self.data_parallel_world_size, ddp_config
-            )
-        else:
-            layout = _default_param_layout(params, bucket_size)
-        self.param_index_map = layout.param_index_map
-        self.bucket_indices = layout.bucket_indices
-        per_bucket_numel_unpadded = layout.per_bucket_numel_unpadded
+        # Use the provided layout if given, otherwise compute the default (no-padding) layout.
+        if param_layout is None:
+            param_layout = default_param_layout(params, bucket_size)
+        self.param_index_map = param_layout.param_index_map
+        self.bucket_indices = param_layout.bucket_indices
+        per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
 
         def _pad(number_to_be_padded: int, divisor: int) -> int:
             return int(math.ceil(number_to_be_padded / divisor) * divisor)

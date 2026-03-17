@@ -49,7 +49,8 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed.param_and_grad_buffer import ParamLayout, _ParamAndGradBuffer, partition_buckets
+from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..distributed.param_layout import ParamLayout, ParamLayoutMap, group_params_by_dtype
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
@@ -109,9 +110,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         'fsdp_dtensor',
     }
 
-    @classmethod
+    @staticmethod
     def compute_param_layout(
-        cls,
         params: List[torch.nn.Parameter],
         bucket_size: Optional[int],
         data_parallel_world_size: int,
@@ -196,6 +196,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
         )
+
+    @staticmethod
+    def compute_param_layouts(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+    ) -> ParamLayoutMap:
+        """Compute parameter layouts for all dtype groups.
+
+        Groups parameters by (param_dtype, grad_dtype), then computes a padded
+        ParamLayout for each group. Returns a ParamLayoutMap containing all layouts.
+
+        Args:
+            params: List of all parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for single bucket.
+            data_parallel_world_size: Size of the data-parallel group.
+            ddp_config: DistributedDataParallel config object.
+
+        Returns:
+            ParamLayoutMap with a ParamLayout per dtype group.
+        """
+        dtype_groups = group_params_by_dtype(params, ddp_config.grad_reduce_in_fp32)
+        layouts = {}
+        for (param_dtype, grad_dtype), (group_params, _) in dtype_groups.items():
+            layouts[(param_dtype, grad_dtype)] = DistributedOptimizer.compute_param_layout(
+                group_params, bucket_size, data_parallel_world_size, ddp_config
+            )
+        return ParamLayoutMap(layouts=layouts)
 
     @classmethod
     def _build_model_gbuf_param_range_map(
