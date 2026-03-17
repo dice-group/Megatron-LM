@@ -137,16 +137,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return int(math.ceil(number_to_be_padded / divisor) * divisor)
 
         def _pad_end_of_bucket(bucket_end_index: int) -> int:
+            """
+            Pads end index of bucket to ensure uniform sharding across DP ranks.
+            Also ensures that all buckets start at a memory address that is 256-byte
+            aligned (128 values since params and grads use >= 16-bit precision).
+            This works around a TE bug causing cuBLAS to pick an incompatible algorithm,
+            and also helps cuBLAS pick more efficient algorithms for GEMMs.
+            """
             if ddp_config.pad_buckets_for_high_nccl_busbw:
+                # Make sure the bucket size is divisible by a large power of 2 (2^16) to
+                # ensure NCCL collectives have high bus bandwidth at large DP counts,
+                # since NCCL message size (which for ring algorithms is bucket_size /
+                # dp_size) apparently needs to be divisible by a power of 2 for high busbw.
                 bucket_size_divisor = math.lcm(data_parallel_world_size, 128, 2**16)
             else:
                 bucket_size_divisor = math.lcm(data_parallel_world_size, 128)
             return _pad(bucket_end_index, bucket_size_divisor)
 
         def _pad_start_of_param(param_start_index: int) -> int:
+            """
+            Pads start index of param to ensure params start at 128-byte aligned
+            addresses (64 values since params are >= 16-bit precision).
+            """
             return _pad(param_start_index, 64)
 
         def _does_param_require_new_bucket(param):
+            """
+            Split shared embedding parameters into a separate bucket so that the
+            first and last pipeline stages partition optimizer state for shared
+            embedding parameters the same way across DP replicas, allowing the
+            DP reduce-scatter to be before the embedding all-reduce.
+            """
             return getattr(param, "shared_embedding", False)
 
         param_index_map = {}
@@ -159,6 +180,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         bucket_id = 0
 
         def _update_bucket_metadata(param_end_index: int) -> int:
+            """
+            Record metadata for the bucket starting at bucket_start_index and ending with the
+            passed-in param_end_index. Returns the bucket's (potentially padded) end_index.
+            """
             nonlocal bucket_start_index, bucket_params, bucket_id
             per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
             bucket_end_index = _pad_end_of_bucket(param_end_index)
@@ -168,17 +193,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_id += 1
             return bucket_end_index
 
+        # Iterate through parameters in reverse order to roughly follow backprop order.
         for param in params[::-1]:
             this_numel = param.data.nelement()
             param_start_index = _pad_start_of_param(param_start_index)
 
+            # Create bucket with collected parameters if current param needs its own bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                # Ensure this param accounts for the new padding introduced at end of
+                # previous bucket.
                 param_start_index = _update_bucket_metadata(param_start_index)
 
             param_end_index = param_start_index + this_numel
             param_index_map[param] = (param_start_index, param_end_index, bucket_id)
             bucket_params.add(param)
 
+            # If we have enough elements already or the current param is part of the shared
+            # embedding layer and needs a separate bucket, form a new bucket.
             if (
                 bucket_size is not None
                 and (param_end_index - bucket_start_index) >= bucket_size
@@ -188,6 +219,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 param_start_index = param_end_index
 
+        # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
             _update_bucket_metadata(param_end_index)
 
