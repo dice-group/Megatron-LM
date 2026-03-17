@@ -806,21 +806,6 @@ class _ParamAndGradBuffer:
         self.bucket_indices = param_layout.bucket_indices
         per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
 
-        def _pad(number_to_be_padded: int, divisor: int) -> int:
-            return int(math.ceil(number_to_be_padded / divisor) * divisor)
-
-        def _pad_end_of_bucket_if_needed(bucket_end_index: int) -> int:
-            """
-            Pads end index of bucket if using distributed optimizer (to ensure uniform sharding).
-            """
-            if self.ddp_config.use_distributed_optimizer:
-                if self.ddp_config.pad_buckets_for_high_nccl_busbw:
-                    bucket_size_divisor = math.lcm(self.data_parallel_world_size, 128, 2**16)
-                else:
-                    bucket_size_divisor = math.lcm(self.data_parallel_world_size, 128)
-                return _pad(bucket_end_index, bucket_size_divisor)
-            return bucket_end_index
-
         # Determine total buffer size from the last bucket's end index.
         bucket_end_index = self.bucket_indices[-1][1]
 
@@ -924,7 +909,7 @@ class _ParamAndGradBuffer:
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
             )
             if bucket_id != cur_bucket_id:
-                bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
+                bucket_end_index = self.bucket_indices[cur_bucket_id][1]
                 self.buckets.append(
                     self._new_bucket(
                         bucket_params=bucket_params,
@@ -943,7 +928,7 @@ class _ParamAndGradBuffer:
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
+            bucket_end_index = self.bucket_indices[cur_bucket_id][1]
             self.buckets.append(
                 self._new_bucket(
                     bucket_params=bucket_params,
