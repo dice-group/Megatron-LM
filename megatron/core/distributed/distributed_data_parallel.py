@@ -14,8 +14,8 @@ from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
-from .param_layout import ParamLayoutMap, group_params_by_dtype
+from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_by_dtype, partition_buckets
+from ..optimizer.param_layout import ParamLayoutMap
 
 logger = logging.getLogger(__name__)
 

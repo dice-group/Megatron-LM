@@ -49,8 +49,8 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
-from ..distributed.param_layout import ParamLayout, ParamLayoutMap, group_params_by_dtype
+from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, group_params_by_dtype, partition_buckets
+from .param_layout import ParamLayout, ParamLayoutMap
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule

@@ -7,7 +7,7 @@ import warnings
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -27,7 +27,6 @@ from ..fp8_utils import (
 )
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_layout import ParamLayout, default_param_layout
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
@@ -726,6 +725,110 @@ class _ParamAndGradBucketGroup:
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
                     self.start_grad_sync(force_all_reduce=force_all_reduce)
+
+
+from ..optimizer.param_layout import ParamLayout
+
+
+def default_param_layout(
+    params: List[torch.nn.Parameter],
+    bucket_size: Optional[int],
+) -> ParamLayout:
+    """Compute parameter layout for the non-distributed-optimizer case.
+
+    No padding is applied. Parameters are iterated in reverse order (backprop order)
+    and grouped into buckets of approximately `bucket_size` elements.
+
+    Args:
+        params: List of parameters to lay out.
+        bucket_size: Approximate number of elements per bucket, or None for a single bucket.
+
+    Returns:
+        ParamLayout with the computed mapping.
+    """
+    param_index_map = {}
+    bucket_indices = []
+    per_bucket_numel_unpadded = []
+
+    param_start_index = 0
+    bucket_start_index = 0
+    bucket_params = set()
+    bucket_id = 0
+
+    for param in params[::-1]:
+        this_numel = param.data.nelement()
+        param_end_index = param_start_index + this_numel
+        param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+        bucket_params.add(param)
+
+        if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_indices.append((bucket_start_index, param_end_index))
+            bucket_start_index = param_end_index
+            bucket_params = set()
+            bucket_id += 1
+            param_start_index = param_end_index
+        else:
+            param_start_index = param_end_index
+
+    # Add remaining params to a new bucket.
+    if len(bucket_params) > 0:
+        per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+        bucket_indices.append((bucket_start_index, param_end_index))
+
+    return ParamLayout(
+        param_index_map=param_index_map,
+        bucket_indices=bucket_indices,
+        per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+    )
+
+
+def group_params_by_dtype(
+    params: List[torch.nn.Parameter],
+    grad_reduce_in_fp32: bool,
+) -> Dict[Tuple[torch.dtype, torch.dtype], Tuple[List[torch.nn.Parameter], List[int]]]:
+    """Group parameters by their (param_dtype, grad_dtype) for buffer allocation.
+
+    For FP8 parameters, the param_dtype is torch.uint8 (the actual storage dtype).
+    Returns a dict mapping (param_dtype, grad_dtype) to (params_list, param_indices).
+
+    The param_indices track each parameter's position among same-dtype params (using
+    the "fake" high-precision dtype for FP8 params), needed for loading non-native-fp8
+    checkpoints in native-fp8 mode.
+
+    Args:
+        params: List of parameters to group.
+        grad_reduce_in_fp32: Whether gradients are reduced in FP32.
+
+    Returns:
+        Dict mapping (param_dtype, grad_dtype) to (params_list, param_indices).
+    """
+    dtype_to_params = {}
+    dtype_to_offsets = {}
+    dtype_to_indices = {}
+
+    for param in params:
+        assert param.requires_grad
+
+        param_dtype = param.dtype
+        if is_float8tensor(param):
+            param_dtype = torch.uint8
+        grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
+
+        param_list = dtype_to_params.get((param_dtype, grad_dtype), [])
+        param_list.append(param)
+        dtype_to_params[(param_dtype, grad_dtype)] = param_list
+
+        offset = dtype_to_offsets.get((param.dtype, grad_dtype), 0)
+        dtype_to_offsets[(param.dtype, grad_dtype)] = offset + 1
+        indices = dtype_to_indices.get((param_dtype, grad_dtype), [])
+        indices.append(offset)
+        dtype_to_indices[(param_dtype, grad_dtype)] = indices
+
+    result = {}
+    for key, param_list in dtype_to_params.items():
+        result[key] = (param_list, dtype_to_indices[key])
+    return result
 
 
 class _ParamAndGradBuffer:
