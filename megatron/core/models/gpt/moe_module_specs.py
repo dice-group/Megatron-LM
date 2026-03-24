@@ -5,6 +5,7 @@ from typing import Optional
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.gate import TopAnyRouter
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -62,7 +63,7 @@ def get_moe_module_spec_for_backend(
     # MoE module spec
     moe_module_spec = ModuleSpec(
         module=MoELayer,
-        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts, router=TopAnyRouter),
         metainfo={"fuse_pre_mlp_layernorm": False},
     )
     return moe_module_spec
