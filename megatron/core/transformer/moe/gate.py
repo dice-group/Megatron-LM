@@ -115,6 +115,12 @@ class TopAnyRouter(Router):
 
         self.sigmoid_target = sigmoid_target
 
+        print(
+            f"[TopAnyRouter] initialized: {num_experts} experts, "
+            f"hidden_size={model_dim}, scale={optimal_scale:.1f}, "
+            f"sigmoid_target={sigmoid_target}"
+        )
+
     def _get_norm_sim_matrix(self):
         """Get L2-normalized similarity matrix (cached during eval)."""
         if self.training or not hasattr(self, '_cached_norm_sim_matrix'):
@@ -186,10 +192,24 @@ class TopAnyRouter(Router):
         # Per-token expert count K (for weight normalization)
         K = exp_counts_per_token + no_expert_mask.float()  # [num_tokens]
 
-        # Store K stats for logging (detached, no grad)
-        self._last_k_mean = K.detach().float().mean()
-        self._last_k_min = K.detach().min()
-        self._last_k_max = K.detach().max()
+        # --- Log K stats (experts-per-token) ---
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+            )
 
         # --- Build Megatron-Core compatible outputs ---
         # routing_map: boolean mask [num_tokens, num_experts]
@@ -306,6 +326,13 @@ class LossFreeTopAnyRouter(Router):
         self.update_rate = update_rate
         self.sigmoid_target = sigmoid_target
 
+        print(
+            f"[LossFreeTopAnyRouter] initialized: {num_experts} experts, "
+            f"hidden_size={model_dim}, scale={optimal_scale:.1f}, "
+            f"sigmoid_target={sigmoid_target}, target_K={target_K}, "
+            f"update_rate={update_rate}"
+        )
+
         # High-precision shadow tensor for threshold updates
         # (buffers can get cast to bf16/fp16 by mixed precision wrappers)
         self._fp32_thresholds = None
@@ -377,10 +404,24 @@ class LossFreeTopAnyRouter(Router):
 
         K = exp_counts_per_token + no_expert_mask.float()
 
-        # Store K stats for logging
-        self._last_k_mean = K.detach().float().mean()
-        self._last_k_min = K.detach().min()
-        self._last_k_max = K.detach().max()
+        # --- Log K stats (experts-per-token) ---
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+            )
 
         # --- Threshold Update Logic (Loss-Free Balancing) ---
         if self.training:
