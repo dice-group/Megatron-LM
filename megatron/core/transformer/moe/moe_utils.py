@@ -919,6 +919,7 @@ def save_to_aux_losses_tracker(
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     avg_group: Optional[torch.distributed.ProcessGroup] = None,
     reduce_group_has_dp: bool = False,
+    reduce_op: str = "sum",
 ) -> None:
     """Save the auxiliary loss for logging.
     Args:
@@ -933,6 +934,7 @@ def save_to_aux_losses_tracker(
         reduce_group_has_dp (bool, optional): Whether the reduce group has data parallel ranks.
             Set this to True if the reduce group has data parallel ranks. This flag is used to
             ensure the correct reduction in aux loss tracking. Defaults to False.
+        reduce_op (str, optional): Reduction operation: "sum", "max", or "min". Defaults to "sum".
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
@@ -941,8 +943,17 @@ def save_to_aux_losses_tracker(
     tracker = get_moe_layer_wise_logging_tracker()
     if name not in tracker:
         tracker[name] = {}
-        tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
-    tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
+        init_val = float('-inf') if reduce_op == "max" else float('inf') if reduce_op == "min" else 0.0
+        tracker[name]["values"] = torch.full((num_layers,), init_val, device=loss.device)
+        tracker[name]["reduce_op"] = reduce_op
+    idx = layer_number - 1
+    val = loss.detach()
+    if reduce_op == "max":
+        tracker[name]["values"][idx] = torch.maximum(tracker[name]["values"][idx], val)
+    elif reduce_op == "min":
+        tracker[name]["values"][idx] = torch.minimum(tracker[name]["values"][idx], val)
+    else:
+        tracker[name]["values"][idx] += val
     tracker[name]["reduce_group"] = reduce_group
     tracker[name]["avg_group"] = avg_group
     tracker[name]["reduce_group_has_dp"] = reduce_group_has_dp
@@ -952,7 +963,13 @@ def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
     tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
-        tracker[name]["values"].zero_()
+        reduce_op = tracker[name].get("reduce_op", "sum")
+        if reduce_op == "max":
+            tracker[name]["values"].fill_(float('-inf'))
+        elif reduce_op == "min":
+            tracker[name]["values"].fill_(float('inf'))
+        else:
+            tracker[name]["values"].zero_()
 
 
 def reduce_aux_losses_tracker_across_ranks(

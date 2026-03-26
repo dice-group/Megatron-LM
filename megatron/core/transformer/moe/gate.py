@@ -206,9 +206,11 @@ class TopAnyRouter(Router):
             )
             save_to_aux_losses_tracker(
                 "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
             )
             save_to_aux_losses_tracker(
                 "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
             )
 
         # --- Build Megatron-Core compatible outputs ---
@@ -418,9 +420,11 @@ class LossFreeTopAnyRouter(Router):
             )
             save_to_aux_losses_tracker(
                 "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
             )
             save_to_aux_losses_tracker(
                 "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
             )
 
         # --- Threshold Update Logic (Loss-Free Balancing) ---
