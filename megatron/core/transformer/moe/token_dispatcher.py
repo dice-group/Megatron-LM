@@ -521,9 +521,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.num_out_tokens = num_local_tokens_per_expert.sum()
             self._maybe_update_cuda_sync_point("before_permutation_1")
         else:
-            # For dropless training, output size is static (num_tokens * topk)
-            # No explicit sync needed
-            self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
+            # For dropless training, output size is usually static (num_tokens * topk)
+            # However, with dynamic routers like TopAnyRouter, it evaluates to sum()
+            self.num_out_tokens = num_local_tokens_per_expert.sum()
+            self._maybe_update_cuda_sync_point("before_permutation_1")
         if self.ep_size > 1 or self.tp_size > 1:
             # ===================================================
             # Calculate input_splits, output_splits for alltoall/allgather in variable size.
