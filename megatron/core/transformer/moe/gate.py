@@ -306,6 +306,7 @@ class LossFreeTopAnyRouter(Router):
         update_rate: float = 0.001,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        del self.weight
 
         model_dim = config.hidden_size
         num_experts = config.num_moe_experts
