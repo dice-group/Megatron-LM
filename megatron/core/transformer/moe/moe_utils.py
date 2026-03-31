@@ -1117,18 +1117,31 @@ def track_moe_metrics(
     if mtp_num_layers is not None:
         num_moe_layers += mtp_num_layers
 
-    aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
-    for name, loss_list in aux_losses.items():
+    for name, entry in tracker.items():
+        loss_list = entry['values'].float() * loss_scale
+        reduce_op = entry.get("reduce_op", "sum")
+
+        # Compute the aggregate value respecting the reduce operation.
+        # For min/max, filter out sentinel values (inf/-inf) from non-MoE layer slots.
+        if reduce_op == "max":
+            finite_mask = loss_list != float('-inf')
+            agg_value = loss_list[finite_mask].max() if finite_mask.any() else torch.tensor(float('nan'))
+        elif reduce_op == "min":
+            finite_mask = loss_list != float('inf')
+            agg_value = loss_list[finite_mask].min() if finite_mask.any() else torch.tensor(float('nan'))
+        else:
+            agg_value = loss_list.sum() / num_moe_layers
+
         if total_loss_dict is not None:
             if name not in total_loss_dict:
-                total_loss_dict[name] = loss_list.sum() / num_moe_layers
+                total_loss_dict[name] = agg_value
             else:
-                total_loss_dict[name] += loss_list.sum() / num_moe_layers
+                total_loss_dict[name] += agg_value
         if writer is not None:
             # currently when using add_scalars,
             # torch.utils.add_scalars makes each timer its own run, which
             # polutes the runs list, so we just add each as a scalar
-            writer.add_scalar(name, loss_list.sum() / num_moe_layers, iteration)
+            writer.add_scalar(name, agg_value, iteration)
             if per_layer_logging:
                 for i, loss in enumerate(loss_list.tolist()):
                     writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
@@ -1137,7 +1150,7 @@ def track_moe_metrics(
             # As a workaround, we log each scalar individually first, then we can create
             # a custom panel to manually group them to a single plot.
             if wandb_writer:
-                wandb_writer.log({f"{name}": loss_list.sum() / num_moe_layers}, iteration)
+                wandb_writer.log({f"{name}": agg_value.item() if hasattr(agg_value, 'item') else agg_value}, iteration)
                 if per_layer_logging:
                     wandb_writer.log(
                         {
