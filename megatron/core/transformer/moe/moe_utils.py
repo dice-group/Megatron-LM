@@ -1112,20 +1112,24 @@ def track_moe_metrics(
                     tracker[key]["reduce_group_has_dp"] = False
     reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
 
-    # Get number of MoE layers
+    # Get number of MoE layers and build a boolean mask for per-layer logging
     if moe_layer_freq is None:
         num_moe_layers = num_layers
+        moe_layer_mask = [True] * num_layers
     elif isinstance(moe_layer_freq, int):
         assert isinstance(num_layers, int)
-        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
-        num_moe_layers = sum(moe_layer_pattern)
+        moe_layer_mask = [(i % moe_layer_freq == 0) for i in range(num_layers)]
+        num_moe_layers = sum(moe_layer_mask)
     elif isinstance(moe_layer_freq, list):
-        num_moe_layers = sum(moe_layer_freq)
+        moe_layer_mask = [bool(f) for f in moe_layer_freq]
+        num_moe_layers = sum(moe_layer_mask)
     else:
         raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
 
     if mtp_num_layers is not None:
         num_moe_layers += mtp_num_layers
+        # Extend mask for MTP layers (assume all MTP layers are MoE)
+        moe_layer_mask.extend([True] * mtp_num_layers)
 
     for name, entry in tracker.items():
         reduce_op = entry.get("reduce_op", "sum")
@@ -1164,7 +1168,8 @@ def track_moe_metrics(
             writer.add_scalar(name, agg_value, iteration)
             if per_layer_logging:
                 for i, loss in enumerate(loss_list.tolist()):
-                    writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
+                    if i < len(moe_layer_mask) and moe_layer_mask[i]:
+                        writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
 
             # W&B logging lacks support for logging multiple scalars simultaneously.
             # As a workaround, we log each scalar individually first, then we can create
@@ -1176,6 +1181,7 @@ def track_moe_metrics(
                         {
                             f"moe/{name}_layer_{i}": loss
                             for i, loss in enumerate(loss_list.tolist())
+                            if i < len(moe_layer_mask) and moe_layer_mask[i]
                         },
                         iteration,
                     )

@@ -303,14 +303,22 @@ class LossFreeTopAnyRouter(Router):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         sigmoid_target: float = 3.0,
-        target_K: float = 2.0,
-        update_rate: float = 0.001,
+        target_K: Optional[float] = None,
+        update_rate: Optional[float] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
         del self.weight
 
         model_dim = config.hidden_size
         num_experts = config.num_moe_experts
+
+        # Read from config, with constructor args as overrides for backward compat
+        self.target_K = target_K if target_K is not None else getattr(
+            config, 'moe_topany_target_k', 2.0
+        )
+        self.update_rate = update_rate if update_rate is not None else getattr(
+            config, 'moe_topany_update_rate', 0.01
+        )
 
         self.sim_matrix = torch.nn.Parameter(
             torch.nn.init.orthogonal_(torch.empty(model_dim, num_experts, dtype=torch.float32)),
@@ -326,15 +334,13 @@ class LossFreeTopAnyRouter(Router):
             torch.tensor(optimal_scale, dtype=torch.float32),
         )
 
-        self.target_K = target_K
-        self.update_rate = update_rate
         self.sigmoid_target = sigmoid_target
 
         print(
             f"[LossFreeTopAnyRouter] initialized: {num_experts} experts, "
             f"hidden_size={model_dim}, scale={optimal_scale:.1f}, "
-            f"sigmoid_target={sigmoid_target}, target_K={target_K}, "
-            f"update_rate={update_rate}"
+            f"sigmoid_target={sigmoid_target}, target_K={self.target_K}, "
+            f"update_rate={self.update_rate}"
         )
 
         # High-precision shadow tensor for threshold updates

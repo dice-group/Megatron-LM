@@ -800,6 +800,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    moe_topany_target_k: float = 2.0
+    """Target average number of experts activated per token for the LossFreeTopAnyRouter.
+    The router dynamically adjusts per-expert thresholds to converge toward this value.
+    For example, with 8 experts and target_K=2.0, the router aims for each token to
+    activate roughly 2 experts on average."""
+
+    moe_topany_update_rate: float = 0.01
+    """Step size for per-expert threshold updates in the LossFreeTopAnyRouter.
+    Higher values converge faster but may oscillate; lower values are more stable
+    but converge slowly. 0.01 works well for small/medium models; for very large
+    models or production runs, 0.001 may be more appropriate."""
+
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
