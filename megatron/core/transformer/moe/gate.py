@@ -203,6 +203,7 @@ class TopAnyRouter(Router):
 
             save_to_aux_losses_tracker(
                 "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
             )
             save_to_aux_losses_tracker(
                 "topany_k_min", K.detach().min().float(), layer_number, num_layers,
@@ -418,6 +419,7 @@ class LossFreeTopAnyRouter(Router):
 
             save_to_aux_losses_tracker(
                 "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
             )
             save_to_aux_losses_tracker(
                 "topany_k_min", K.detach().min().float(), layer_number, num_layers,

@@ -963,7 +963,10 @@ def save_to_aux_losses_tracker(
         reduce_group_has_dp (bool, optional): Whether the reduce group has data parallel ranks.
             Set this to True if the reduce group has data parallel ranks. This flag is used to
             ensure the correct reduction in aux loss tracking. Defaults to False.
-        reduce_op (str, optional): Reduction operation: "sum", "max", or "min". Defaults to "sum".
+        reduce_op (str, optional): Reduction operation: "sum", "max", "min", or "replace".
+            Use "replace" for metrics (not losses) that should just store the latest value
+            (idempotent — safe if forward() is called more than once per step).
+            Defaults to "sum".
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
@@ -972,7 +975,12 @@ def save_to_aux_losses_tracker(
     tracker = get_moe_layer_wise_logging_tracker()
     if name not in tracker:
         tracker[name] = {}
-        init_val = float('-inf') if reduce_op == "max" else float('inf') if reduce_op == "min" else 0.0
+        if reduce_op == "max":
+            init_val = float('-inf')
+        elif reduce_op == "min":
+            init_val = float('inf')
+        else:  # "sum" or "replace"
+            init_val = 0.0
         tracker[name]["values"] = torch.full((num_layers,), init_val, device=loss.device)
         tracker[name]["reduce_op"] = reduce_op
     idx = layer_number - 1
@@ -981,6 +989,8 @@ def save_to_aux_losses_tracker(
         tracker[name]["values"][idx] = torch.maximum(tracker[name]["values"][idx], val)
     elif reduce_op == "min":
         tracker[name]["values"][idx] = torch.minimum(tracker[name]["values"][idx], val)
+    elif reduce_op == "replace":
+        tracker[name]["values"][idx] = val
     else:
         tracker[name]["values"][idx] += val
     tracker[name]["reduce_group"] = reduce_group
@@ -997,7 +1007,7 @@ def clear_aux_losses_tracker() -> None:
             tracker[name]["values"].fill_(float('-inf'))
         elif reduce_op == "min":
             tracker[name]["values"].fill_(float('inf'))
-        else:
+        else:  # "sum" or "replace"
             tracker[name]["values"].zero_()
 
 
@@ -1118,8 +1128,14 @@ def track_moe_metrics(
         num_moe_layers += mtp_num_layers
 
     for name, entry in tracker.items():
-        loss_list = entry['values'].float() * loss_scale
         reduce_op = entry.get("reduce_op", "sum")
+        # Only apply loss_scale to accumulated losses ("sum").  Metrics that
+        # use min/max/replace are raw statistics (e.g. expert-count stats)
+        # and must not be scaled.
+        if reduce_op == "sum":
+            loss_list = entry['values'].float() * loss_scale
+        else:
+            loss_list = entry['values'].float()
 
         # Compute the aggregate value respecting the reduce operation.
         # For min/max, filter out sentinel values (inf/-inf) from non-MoE layer slots.
@@ -1129,6 +1145,10 @@ def track_moe_metrics(
         elif reduce_op == "min":
             finite_mask = loss_list != float('inf')
             agg_value = loss_list[finite_mask].min() if finite_mask.any() else torch.tensor(float('nan'))
+        elif reduce_op == "replace":
+            # For "replace" metrics, take the mean across layers that have been written
+            non_zero_mask = loss_list != 0.0
+            agg_value = loss_list[non_zero_mask].mean() if non_zero_mask.any() else torch.tensor(float('nan'))
         else:
             agg_value = loss_list.sum() / num_moe_layers
 
