@@ -201,6 +201,19 @@ class TopAnyRouter(Router):
                 "topany_k_max", K.detach().max().float(), layer_number, num_layers,
                 reduce_op="max",
             )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K.detach().float().std(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+
+            # --- Log K distribution (fraction of tokens routed to exactly i experts) ---
+            k_int = K.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_experts + 1)
+            for i in range(1, self.num_experts + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens,
+                    layer_number, num_layers, reduce_op="replace",
+                )
 
         # --- Build Megatron-Core compatible outputs ---
         # routing_map: boolean mask [num_tokens, num_experts]
@@ -393,6 +406,19 @@ class LossFreeTopAnyRouter(Router):
                 "topany_k_max", K.detach().max().float(), layer_number, num_layers,
                 reduce_op="max",
             )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K.detach().float().std(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+
+            # --- Log K distribution (fraction of tokens routed to exactly i experts) ---
+            k_int = K.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_experts + 1)
+            for i in range(1, self.num_experts + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens,
+                    layer_number, num_layers, reduce_op="replace",
+                )
 
         # --- Threshold Update Logic (Loss-Free Balancing) ---
         if self.training:
