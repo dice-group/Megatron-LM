@@ -160,18 +160,6 @@ class TopAnyRouter(Router):
         # pre_sigmoid: [num_tokens, num_experts]
         pre_sigmoid = torch.matmul(norm_input, norm_sim_matrix) * self.logit_scale
 
-        # --- Z-loss: penalize large logit magnitudes for training stability ---
-        if (
-            self.config.moe_z_loss_coeff is not None
-            and self.config.moe_z_loss_coeff > 0
-            and self.training
-            and torch.is_grad_enabled()
-        ):
-            z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
-            z_loss = z_loss_coeff * torch.mean(torch.logsumexp(pre_sigmoid, dim=1) ** 2)
-        else:
-            z_loss = None
-
         # --- Probability Bounding & Thresholding ---
         raw_logits = torch.sigmoid(pre_sigmoid)
         gates_scaled = torch.sigmoid(self.gate_thresholds.float())
@@ -255,24 +243,6 @@ class TopAnyRouter(Router):
                     reduce_group=self.tp_cp_group,
                 )
 
-            # Attach z-loss
-            if z_loss is not None:
-                probs = MoEAuxLossAutoScaler.apply(probs, z_loss)
-
-                num_layers = self.config.num_layers
-                if self.config.mtp_num_layers is not None:
-                    num_layers += self.config.mtp_num_layers
-                layer_number = self.layer_number
-                if self.is_mtp_layer:
-                    layer_number = self.layer_number + self.config.num_layers
-
-                save_to_aux_losses_tracker(
-                    "z_loss",
-                    z_loss / (self.config.moe_z_loss_coeff / self.tp_cp_group.size()),
-                    layer_number,
-                    num_layers,
-                )
-
         return probs, routing_map
 
     def routing(self, logits: torch.Tensor):
@@ -326,7 +296,7 @@ class LossFreeTopAnyRouter(Router):
         )
 
         # Buffer for per-expert thresholds (not optimized by gradient descent)
-        self.register_buffer("gate_thresholds", torch.full((num_experts,), -1.0))
+        self.register_buffer("gate_thresholds", torch.full((num_experts,), 0.0))
 
         optimal_scale = sigmoid_target * math.sqrt(model_dim)
         self.register_buffer(
@@ -379,18 +349,6 @@ class LossFreeTopAnyRouter(Router):
         norm_input = F.normalize(input_fp32, dim=1)
         norm_sim_matrix = self._get_norm_sim_matrix()
         pre_sigmoid = torch.matmul(norm_input, norm_sim_matrix) * self.logit_scale
-
-        # --- Z-loss ---
-        if (
-            self.config.moe_z_loss_coeff is not None
-            and self.config.moe_z_loss_coeff > 0
-            and self.training
-            and torch.is_grad_enabled()
-        ):
-            z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
-            z_loss = z_loss_coeff * torch.mean(torch.logsumexp(pre_sigmoid, dim=1) ** 2)
-        else:
-            z_loss = None
 
         # --- Sync fp32 shadow thresholds ---
         if self._fp32_thresholds is None or self._fp32_thresholds.device != input.device:
@@ -449,24 +407,6 @@ class LossFreeTopAnyRouter(Router):
         # --- Build Megatron-Core compatible outputs ---
         routing_map = gates.bool()
         probs = (gates / torch.clamp(K, 1).unsqueeze(1)).to(input.dtype)
-
-        # --- Z-loss attachment ---
-        if self.training and torch.is_grad_enabled() and z_loss is not None:
-            probs = MoEAuxLossAutoScaler.apply(probs, z_loss)
-
-            num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                num_layers += self.config.mtp_num_layers
-            layer_number = self.layer_number
-            if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
-
-            save_to_aux_losses_tracker(
-                "z_loss",
-                z_loss / (self.config.moe_z_loss_coeff / self.tp_cp_group.size()),
-                layer_number,
-                num_layers,
-            )
 
         return probs, routing_map
 
