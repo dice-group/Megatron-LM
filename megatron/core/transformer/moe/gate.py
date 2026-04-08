@@ -308,8 +308,20 @@ class LossFreeTopAnyRouter(Router):
             requires_grad=True,
         )
 
+        # Calculate statistically optimal initial threshold
+        # We model the pre_sigmoid scores as roughly N(0, sigmoid_target^2)
+        # We want the probability p = target_K / num_experts of exceeding the threshold T:
+        # P(Z > T) = p => T = sigmoid_target * inverse_cdf_normal(1 - p)
+        # icdf(x) = sqrt(2) * erfinv(2x - 1)
+        p = self.target_K / num_experts
+        if 0 < p < 1:
+            icdf_val = math.sqrt(2.0) * torch.erfinv(torch.tensor(2.0 * (1.0 - p) - 1.0)).item()
+            init_t = sigmoid_target * icdf_val
+        else:
+            init_t = 0.0
+
         # Buffer for per-expert thresholds (not optimized by gradient descent)
-        self.register_buffer("gate_thresholds", torch.full((num_experts,), 0.0))
+        self.register_buffer("gate_thresholds", torch.full((num_experts,), init_t))
 
         optimal_scale = sigmoid_target * math.sqrt(model_dim)
         self.register_buffer(
