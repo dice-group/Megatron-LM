@@ -435,11 +435,19 @@ class LossFreeTopAnyRouter(Router):
         # --- Threshold Update Logic (Loss-Free Balancing) ---
         if self.training:
             with torch.no_grad():
-                target_c = (num_tokens * self.target_K) / self.num_experts
-                actual_c = gates.sum(dim=0)
-                e_i = actual_c - target_c
+                # 1. Global K adjustment (keeps average K equal to target_K)
+                current_K = gates.sum() / num_tokens
+                global_error = current_K - self.target_K
+                global_step = self.update_rate * global_error
 
-                self._fp32_thresholds += self.update_rate * torch.sign(e_i)
+                # 2. Local balancing adjustment (shifts experts relative to each other)
+                actual_c = gates.sum(dim=0)
+                mean_actual = actual_c.mean()
+                local_error = actual_c - mean_actual
+                local_step = self.update_rate * torch.sign(local_error)
+
+                # Combine decoupled updates
+                self._fp32_thresholds += (global_step + local_step)
                 self.gate_thresholds.copy_(self._fp32_thresholds)
 
         # --- Build Megatron-Core compatible outputs ---
