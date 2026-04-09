@@ -812,6 +812,11 @@ class TransformerConfig(ModelParallelConfig):
     but converge slowly. 0.01 works well for small/medium models; for very large
     models or production runs, 0.001 may be more appropriate."""
 
+    moe_topany_threshold_update_mode: str = "sign"
+    """Threshold update strategy for the LossFreeTopAnyRouter.
+    - "sign": Fixed-magnitude step in the direction of the error (stable, slower convergence).
+    - "magnitude": Step proportional to the error magnitude (faster convergence, may oscillate)."""
+
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 

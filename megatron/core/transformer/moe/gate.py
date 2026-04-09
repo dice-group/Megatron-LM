@@ -281,6 +281,8 @@ class LossFreeTopAnyRouter(Router):
         sigmoid_target (float): Target pre-sigmoid standard deviation.
         target_K (float): Desired average number of experts per token (e.g., 2.0).
         update_rate (float): Step size for per-expert threshold updates.
+        threshold_update_mode (str): "sign" for fixed-magnitude steps, "magnitude" for
+            error-proportional steps.
     """
 
     def __init__(
@@ -291,6 +293,7 @@ class LossFreeTopAnyRouter(Router):
         sigmoid_target: float = 3.0,
         target_K: Optional[float] = None,
         update_rate: Optional[float] = None,
+        threshold_update_mode: Optional[str] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
         del self.weight
@@ -307,6 +310,12 @@ class LossFreeTopAnyRouter(Router):
         )
         self.update_rate = update_rate if update_rate is not None else getattr(
             config, 'moe_topany_update_rate', 0.01
+        )
+        self.threshold_update_mode = threshold_update_mode if threshold_update_mode is not None else getattr(
+            config, 'moe_topany_threshold_update_mode', 'sign'
+        )
+        assert self.threshold_update_mode in ("sign", "magnitude"), (
+            f"Unknown threshold_update_mode '{self.threshold_update_mode}'. Expected 'sign' or 'magnitude'."
         )
 
         self.sim_matrix = torch.nn.Parameter(
@@ -341,7 +350,8 @@ class LossFreeTopAnyRouter(Router):
             f"[LossFreeTopAnyRouter] initialized: {num_experts} experts, "
             f"hidden_size={model_dim}, scale={optimal_scale:.1f}, "
             f"sigmoid_target={sigmoid_target}, target_K={self.target_K}, "
-            f"update_rate={self.update_rate}"
+            f"update_rate={self.update_rate}, "
+            f"threshold_update_mode={self.threshold_update_mode}"
         )
 
         # High-precision shadow tensor for threshold updates
@@ -445,7 +455,10 @@ class LossFreeTopAnyRouter(Router):
                 actual_c = gates.sum(dim=0)
                 e_i = actual_c - target_c
 
-                self._fp32_thresholds += self.update_rate * torch.sign(e_i)
+                if self.threshold_update_mode == "sign":
+                    self._fp32_thresholds += self.update_rate * torch.sign(e_i)
+                else:  # "magnitude"
+                    self._fp32_thresholds += self.update_rate * e_i
                 self.gate_thresholds.copy_(self._fp32_thresholds)
 
         # --- Build Megatron-Core compatible outputs ---
