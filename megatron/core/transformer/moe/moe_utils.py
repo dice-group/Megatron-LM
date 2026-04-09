@@ -1186,6 +1186,30 @@ def track_moe_metrics(
                         iteration,
                     )
 
+    # Log topany_k_dist as a bar chart in W&B
+    if wandb_writer:
+        k_dist_data = []
+        for name, entry in tracker.items():
+            if name.startswith("topany_k_dist_"):
+                k = int(name.split("_")[-1])
+                loss_list = entry['values'].float()
+                non_zero_mask = loss_list != 0.0
+                val = loss_list[non_zero_mask].mean().item() if non_zero_mask.any() else 0.0
+                k_dist_data.append((k, val))
+        if k_dist_data:
+            k_dist_data.sort(key=lambda x: x[0])
+            table = wandb_writer.Table(
+                data=[[str(k), frac] for k, frac in k_dist_data],
+                columns=["experts_per_token", "fraction"],
+            )
+            wandb_writer.log(
+                {"topany_k_distribution": wandb_writer.plot.bar(
+                    table, "experts_per_token", "fraction",
+                    title="Experts per Token Distribution",
+                )},
+                iteration,
+            )
+
     clear_aux_losses_tracker()
 
 
