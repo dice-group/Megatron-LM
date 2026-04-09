@@ -250,6 +250,11 @@ class _ParamAndGradBucketGroup:
         """
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
             # Record golden per_param_grad_ready_counts.
+            if len(self.per_param_grad_ready_counts) != len(self.params):
+                missing_params = self.params - set(self.per_param_grad_ready_counts.keys())
+                for p in missing_params:
+                    # Print size/dtype to identify the param
+                    print(f"DEBUG: Missing param grad! shape={p.shape}, dtype={p.dtype}, req_grad={p.requires_grad}")
             assert len(self.per_param_grad_ready_counts) == len(self.params)
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
             self.is_first_batch = False
