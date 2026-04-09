@@ -89,6 +89,9 @@ class TopAnyRouter(Router):
         # self.weight (standard gate linear), process groups, etc.
         super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
         del self.weight
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
 
         model_dim = config.hidden_size
         num_experts = config.num_moe_experts
@@ -291,6 +294,9 @@ class LossFreeTopAnyRouter(Router):
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
         del self.weight
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
 
         model_dim = config.hidden_size
         num_experts = config.num_moe_experts
