@@ -1208,7 +1208,7 @@ def track_moe_metrics(
             ax.set_xlabel("Experts per Token")
             ax.set_ylabel("Fraction")
             ax.set_title("Experts per Token Distribution")
-            wandb_writer.log({"topany_k_distribution": fig}, iteration)
+            wandb_writer.log({"topany_k_distribution": wandb_writer.Image(fig)}, iteration)
             plt.close(fig)
 
     clear_aux_losses_tracker()
