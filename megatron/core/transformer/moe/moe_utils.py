@@ -1198,17 +1198,18 @@ def track_moe_metrics(
                 k_dist_data.append((k, val))
         if k_dist_data:
             k_dist_data.sort(key=lambda x: x[0])
-            table = wandb_writer.Table(
-                data=[[str(k), frac] for k, frac in k_dist_data],
-                columns=["experts_per_token", "fraction"],
-            )
-            wandb_writer.log(
-                {"topany_k_distribution": wandb_writer.plot.bar(
-                    table, "experts_per_token", "fraction",
-                    title="Experts per Token Distribution",
-                )},
-                iteration,
-            )
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            ks = [str(k) for k, _ in k_dist_data]
+            fracs = [frac for _, frac in k_dist_data]
+            fig, ax = plt.subplots()
+            ax.bar(ks, fracs)
+            ax.set_xlabel("Experts per Token")
+            ax.set_ylabel("Fraction")
+            ax.set_title("Experts per Token Distribution")
+            wandb_writer.log({"topany_k_distribution": fig}, iteration)
+            plt.close(fig)
 
     clear_aux_losses_tracker()
 
