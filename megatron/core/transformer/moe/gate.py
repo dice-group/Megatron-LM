@@ -222,9 +222,14 @@ class TopAnyRouter(Router):
         # routing_map: boolean mask [num_tokens, num_experts]
         routing_map = gates.bool()
 
-        # probs: normalized weights [num_tokens, num_experts]
-        # Each token's weights are normalized by K (number of active experts)
-        probs = (gates / torch.clamp(K, 1).unsqueeze(1)).to(input.dtype)
+        # probs: soft weights masked by the binary gates, renormalized to sum to 1.
+        # Uses raw_logits (sigmoid of cosine similarity) as per-expert confidence so a
+        # high-match expert dominates instead of being diluted to 1/K. Gradient flows
+        # through both raw_logits (smooth) and gates (STE).
+        soft_weights = raw_logits * gates
+        probs = (
+            soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        ).to(input.dtype)
 
         # --- Auxiliary load-balancing loss ---
         if self.training and torch.is_grad_enabled():
@@ -451,19 +456,44 @@ class LossFreeTopAnyRouter(Router):
         # --- Threshold Update Logic (Loss-Free Balancing) ---
         if self.training:
             with torch.no_grad():
-                target_c = (num_tokens * self.target_K) / self.num_experts
-                actual_c = gates.sum(dim=0)
+                # Sum expert counts across all ranks that see different tokens
+                # (TP x DP x CP). Without this, per-rank thresholds drift and the
+                # routing decisions diverge between replicas.
+                actual_c = gates.sum(dim=0).float()
+                group = self.tp_dp_cp_group
+                world_size = (
+                    torch.distributed.get_world_size(group)
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        and group is not None
+                    )
+                    else 1
+                )
+                if world_size > 1:
+                    torch.distributed.all_reduce(actual_c, group=group)
+
+                global_num_tokens = num_tokens * world_size
+                target_c = (global_num_tokens * self.target_K) / self.num_experts
                 e_i = actual_c - target_c
 
                 if self.threshold_update_mode == "sign":
                     self._fp32_thresholds += self.update_rate * torch.sign(e_i)
                 else:  # "magnitude"
-                    self._fp32_thresholds += self.update_rate * e_i
+                    # Normalize by world_size so per-step update is on the same
+                    # scale as the pre-sync single-rank version.
+                    self._fp32_thresholds += (self.update_rate / world_size) * e_i
                 self.gate_thresholds.copy_(self._fp32_thresholds)
 
         # --- Build Megatron-Core compatible outputs ---
         routing_map = gates.bool()
-        probs = (gates / torch.clamp(K, 1).unsqueeze(1)).to(input.dtype)
+
+        # Soft weights: raw_logits masked by binary gates, renormalized per token.
+        # See TopAnyRouter.forward for rationale.
+        soft_weights = raw_logits * gates
+        probs = (
+            soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        ).to(input.dtype)
 
         return probs, routing_map
 
