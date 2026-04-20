@@ -30,26 +30,18 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 # ─── STE for binary gating ──────────────────────────────────────────────────
 
 class GAMoEGateSTEBackward(torch.autograd.Function):
-    """Straight-Through Estimator (STE) variant:
+    """Straight-Through Estimator (STE):
     - forward: hard binary decision (scores > 0).float()
-    - backward: multiply incoming gradient by sigmoid'(scores) (= sigma*(1-sigma))
-
-    This produces hard forward decisions while providing a smooth (sigmoid) shaped
-    gradient in the backward pass.
+    - backward: identity — pass gradients through unchanged.
     """
 
     @staticmethod
     def forward(ctx, scores: Tensor) -> Tensor:
-        hard = (scores > 0).float()
-        soft = scores.sigmoid()
-        ctx.save_for_backward(soft)
-        return hard
+        return (scores > 0).float()
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tensor:
-        (soft,) = ctx.saved_tensors
-        grad = grad_output * (soft * (1.0 - soft))
-        return grad
+        return grad_output
 
 
 # ─── Megatron-Core compatible Top-Any Router ─────────────────────────────────
@@ -480,9 +472,9 @@ class LossFreeTopAnyRouter(Router):
                 if self.threshold_update_mode == "sign":
                     self._fp32_thresholds += self.update_rate * torch.sign(e_i)
                 else:  # "magnitude"
-                    # Normalize by world_size so per-step update is on the same
-                    # scale as the pre-sync single-rank version.
-                    self._fp32_thresholds += (self.update_rate / world_size) * e_i
+                    # Normalize by target_c so the update rate is independent of
+                    # batch size, world size, and number of experts.
+                    self._fp32_thresholds += self.update_rate * (e_i / target_c)
                 self.gate_thresholds.copy_(self._fp32_thresholds)
 
         # --- Build Megatron-Core compatible outputs ---
