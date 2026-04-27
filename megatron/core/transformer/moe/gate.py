@@ -12,6 +12,7 @@ Contains:
 """
 
 import math
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -410,7 +411,7 @@ class LossFreeTopAnyRouter(Router):
 
         K = exp_counts_per_token + no_expert_mask.float()
 
-        # --- Log K stats (experts-per-token) ---
+        # --- Log K stats (experts-per-token) + threshold/fallback diagnostics ---
         if self.training and torch.is_grad_enabled():
             num_layers = self.config.num_layers
             if self.config.mtp_num_layers is not None:
@@ -445,6 +446,33 @@ class LossFreeTopAnyRouter(Router):
                     layer_number, num_layers, reduce_op="replace",
                 )
 
+            # --- Threshold + fallback diagnostics (load-bearing for tuning update_rate) ---
+            t = self._fp32_thresholds.detach() if self._fp32_thresholds is not None else self.gate_thresholds.detach().float()
+            save_to_aux_losses_tracker(
+                "threshold_mean", t.mean(), layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "threshold_std", t.std(), layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "threshold_abs_max", t.abs().max(), layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "no_expert_fallback_frac",
+                no_expert_mask.float().mean(), layer_number, num_layers, reduce_op="replace",
+            )
+            # Per-expert load imbalance (max/min ratio of normalized expert counts)
+            ec = gates.sum(dim=0).detach().float()
+            ec_mean = ec.mean().clamp_min(1e-6)
+            save_to_aux_losses_tracker(
+                "expert_load_max_over_mean", ec.max() / ec_mean,
+                layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "expert_load_min_over_mean", ec.min() / ec_mean,
+                layer_number, num_layers, reduce_op="replace",
+            )
+
         # --- Threshold Update Logic (Loss-Free Balancing) ---
         if self.training:
             with torch.no_grad():
@@ -470,12 +498,36 @@ class LossFreeTopAnyRouter(Router):
                 e_i = actual_c - target_c
 
                 if self.threshold_update_mode == "sign":
-                    self._fp32_thresholds += self.update_rate * torch.sign(e_i)
+                    delta = self.update_rate * torch.sign(e_i)
                 else:  # "magnitude"
                     # Normalize by target_c so the update rate is independent of
                     # batch size, world size, and number of experts.
-                    self._fp32_thresholds += self.update_rate * (e_i / target_c)
+                    delta = self.update_rate * (e_i / target_c)
+                self._fp32_thresholds += delta
                 self.gate_thresholds.copy_(self._fp32_thresholds)
+
+                if torch.is_grad_enabled():
+                    num_layers_d = self.config.num_layers
+                    if self.config.mtp_num_layers is not None:
+                        num_layers_d += self.config.mtp_num_layers
+                    layer_number_d = self.layer_number
+                    if self.is_mtp_layer:
+                        layer_number_d = self.layer_number + self.config.num_layers
+                    save_to_aux_losses_tracker(
+                        "threshold_delta_abs_mean", delta.abs().mean(),
+                        layer_number_d, num_layers_d, reduce_op="replace",
+                    )
+                    save_to_aux_losses_tracker(
+                        "threshold_delta_abs_max", delta.abs().max(),
+                        layer_number_d, num_layers_d, reduce_op="replace",
+                    )
+
+                # --- Diagnostic CSV (rank 0, layer 0 only, append per call) ---
+                self._append_diag_row(
+                    K=K, no_expert_mask=no_expert_mask, gates=gates,
+                    delta=delta, t=self._fp32_thresholds, num_tokens=num_tokens,
+                    target_c=target_c,
+                )
 
         # --- Build Megatron-Core compatible outputs ---
         routing_map = gates.bool()
@@ -492,3 +544,81 @@ class LossFreeTopAnyRouter(Router):
     def routing(self, logits: torch.Tensor):
         """Not used — Top-Any routing is handled entirely in forward()."""
         raise NotImplementedError("LossFreeTopAnyRouter uses forward() directly, not routing().")
+
+    def _append_diag_row(self, K, no_expert_mask, gates, delta, t, num_tokens, target_c):
+        """Append a single diagnostic row to a CSV file.
+
+        Only rank 0, only the first MoE layer (layer_number == 0). One row per
+        forward call. Path: $LOSSFREE_DIAG_FILE or
+        logs/lossfree_diag_<RUN_NAME>.csv (relative to cwd).
+        """
+        # Gate by layer + rank (cheap checks first)
+        if self.layer_number != 0:
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+
+        # Initialize file on first call
+        if not hasattr(self, "_diag_file_path"):
+            run_name = os.environ.get("RUN_NAME", "unknown")
+            default_path = os.path.join("logs", f"lossfree_diag_{run_name}.csv")
+            self._diag_file_path = os.environ.get("LOSSFREE_DIAG_FILE", default_path)
+            self._diag_call_count = 0
+            try:
+                os.makedirs(os.path.dirname(self._diag_file_path) or ".", exist_ok=True)
+                with open(self._diag_file_path, "w") as f:
+                    f.write(
+                        "call,k_mean,k_std,k_min,k_max,no_expert_frac,"
+                        "threshold_mean,threshold_std,threshold_abs_max,"
+                        "threshold_delta_abs_mean,threshold_delta_abs_max,"
+                        "expert_load_max_over_mean,expert_load_min_over_mean,"
+                        "expert_load_dead_count,expert_load_hot_count,"
+                        "target_K,update_rate,update_mode,num_experts\n"
+                    )
+                print(f"[LossFreeTopAnyRouter] diagnostic CSV: {self._diag_file_path}")
+            except Exception as e:
+                print(f"[LossFreeTopAnyRouter] failed to open diag file: {e}")
+                self._diag_file_path = None
+
+        if self._diag_file_path is None:
+            return
+
+        self._diag_call_count += 1
+
+        # All work in fp32 + .item() to avoid keeping CUDA refs in the CSV path
+        K_f = K.detach().float()
+        ec = gates.sum(dim=0).detach().float()
+        ec_mean = ec.mean().clamp_min(1e-6)
+        # "Dead" = <10% of mean load. "Hot" = >2x mean load. Cheap stability proxies.
+        dead = (ec < 0.1 * ec_mean).sum().item()
+        hot = (ec > 2.0 * ec_mean).sum().item()
+
+        row = [
+            self._diag_call_count,
+            K_f.mean().item(),
+            K_f.std().item(),
+            K_f.min().item(),
+            K_f.max().item(),
+            no_expert_mask.float().mean().item(),
+            t.mean().item(),
+            t.std().item(),
+            t.abs().max().item(),
+            delta.abs().mean().item(),
+            delta.abs().max().item(),
+            (ec.max() / ec_mean).item(),
+            (ec.min() / ec_mean).item(),
+            dead,
+            hot,
+            self.target_K,
+            self.update_rate,
+            self.threshold_update_mode,
+            self.num_experts,
+        ]
+        try:
+            with open(self._diag_file_path, "a") as f:
+                f.write(",".join(str(x) for x in row) + "\n")
+        except Exception as e:
+            # Don't crash training over diagnostic logging
+            if self._diag_call_count <= 3:
+                print(f"[LossFreeTopAnyRouter] diag write failed: {e}")
