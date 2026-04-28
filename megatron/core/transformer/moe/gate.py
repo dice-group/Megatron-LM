@@ -441,43 +441,51 @@ class LossFreeTopAnyRouter(Router):
             )
 
             # --- Log K distribution (fraction of tokens routed to exactly i experts) ---
+            # _EPS guards against the moe_utils tracker treating exact 0.0 as
+            # "layer not written" (its filter is `loss_list != 0.0`). When ALL
+            # MoE layers report 0.0 the tracker falls back to a CPU NaN tensor,
+            # which then mismatches device with the cuda accumulator → crash.
+            _EPS = 1e-30
             k_int = K.detach().long()
             counts = torch.bincount(k_int, minlength=self.num_experts + 1)
             for i in range(1, self.num_experts + 1):
                 save_to_aux_losses_tracker(
-                    f"topany_k_dist_{i}", counts[i].float() / num_tokens,
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
                     layer_number, num_layers, reduce_op="replace",
                 )
 
             # --- Threshold + fallback diagnostics (load-bearing for tuning update_rate) ---
             t = self._fp32_thresholds.detach() if self._fp32_thresholds is not None else self.gate_thresholds.detach().float()
             save_to_aux_losses_tracker(
-                "threshold_mean", t.mean(), layer_number, num_layers, reduce_op="replace",
+                "threshold_mean", t.mean() + _EPS, layer_number, num_layers, reduce_op="replace",
             )
             save_to_aux_losses_tracker(
-                "threshold_std", t.std(), layer_number, num_layers, reduce_op="replace",
+                "threshold_std", t.std() + _EPS, layer_number, num_layers, reduce_op="replace",
             )
             save_to_aux_losses_tracker(
-                "threshold_abs_max", t.abs().max(), layer_number, num_layers, reduce_op="replace",
+                "threshold_abs_max", t.abs().max() + _EPS, layer_number, num_layers, reduce_op="replace",
             )
             save_to_aux_losses_tracker(
                 "no_expert_fallback_frac",
-                no_expert_mask.float().mean(), layer_number, num_layers, reduce_op="replace",
+                no_expert_mask.float().mean() + _EPS, layer_number, num_layers, reduce_op="replace",
             )
             # Per-expert load imbalance (max/min ratio of normalized expert counts)
             ec = gates.sum(dim=0).detach().float()
             ec_mean = ec.mean().clamp_min(1e-6)
             save_to_aux_losses_tracker(
-                "expert_load_max_over_mean", ec.max() / ec_mean,
+                "expert_load_max_over_mean", ec.max() / ec_mean + _EPS,
                 layer_number, num_layers, reduce_op="replace",
             )
             save_to_aux_losses_tracker(
-                "expert_load_min_over_mean", ec.min() / ec_mean,
+                "expert_load_min_over_mean", ec.min() / ec_mean + _EPS,
                 layer_number, num_layers, reduce_op="replace",
             )
 
         # --- Threshold Update Logic (Loss-Free Balancing) ---
         if self.training:
+            # Capture grad-enabled state BEFORE entering no_grad (otherwise
+            # torch.is_grad_enabled() inside the block always returns False).
+            log_metrics = torch.is_grad_enabled()
             with torch.no_grad():
                 # Sum expert counts across all ranks that see different tokens
                 # (TP x DP x CP). Without this, per-rank thresholds drift and the
@@ -509,7 +517,8 @@ class LossFreeTopAnyRouter(Router):
                 self._fp32_thresholds += delta
                 self.gate_thresholds.copy_(self._fp32_thresholds)
 
-                if torch.is_grad_enabled():
+                if log_metrics:
+                    _EPS = 1e-30
                     num_layers_d = self.config.num_layers
                     if self.config.mtp_num_layers is not None:
                         num_layers_d += self.config.mtp_num_layers
@@ -517,11 +526,11 @@ class LossFreeTopAnyRouter(Router):
                     if self.is_mtp_layer:
                         layer_number_d = self.layer_number + self.config.num_layers
                     save_to_aux_losses_tracker(
-                        "threshold_delta_abs_mean", delta.abs().mean(),
+                        "threshold_delta_abs_mean", delta.abs().mean() + _EPS,
                         layer_number_d, num_layers_d, reduce_op="replace",
                     )
                     save_to_aux_losses_tracker(
-                        "threshold_delta_abs_max", delta.abs().max(),
+                        "threshold_delta_abs_max", delta.abs().max() + _EPS,
                         layer_number_d, num_layers_d, reduce_op="replace",
                     )
 
