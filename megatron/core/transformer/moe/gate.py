@@ -264,6 +264,9 @@ class TopAnyRouter(Router):
         raise NotImplementedError("TopAnyRouter uses forward() directly, not routing().")
 
 
+_DIAG_LOGGER_LAYER = None  # First LossFreeTopAnyRouter instance to log claims this; others skip.
+
+
 class LossFreeTopAnyRouter(Router):
     """Loss-Free Top-Any Router.
 
@@ -548,16 +551,26 @@ class LossFreeTopAnyRouter(Router):
     def _append_diag_row(self, K, no_expert_mask, gates, delta, t, num_tokens, target_c):
         """Append a single diagnostic row to a CSV file.
 
-        Only rank 0, only the first MoE layer (layer_number == 0). One row per
-        forward call. Path: $LOSSFREE_DIAG_FILE or
+        Only rank 0, only the first LossFreeTopAnyRouter instance to enter this
+        function (claims via module-global _DIAG_LOGGER_LAYER). One row per
+        forward call from that one layer. Path: $LOSSFREE_DIAG_FILE or
         logs/lossfree_diag_<RUN_NAME>.csv (relative to cwd).
+
+        Note: Megatron's layer_number is 1-indexed and depends on PP offset, so
+        we don't filter by a hardcoded number — we just take the first one.
         """
-        # Gate by layer + rank (cheap checks first)
-        if self.layer_number != 0:
-            return
+        global _DIAG_LOGGER_LAYER
+
+        # Rank gate first (cheapest)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
                 return
+
+        # Layer gate: first instance to reach here on rank 0 owns logging
+        if _DIAG_LOGGER_LAYER is None:
+            _DIAG_LOGGER_LAYER = self.layer_number
+        if self.layer_number != _DIAG_LOGGER_LAYER:
+            return
 
         # Initialize file on first call
         if not hasattr(self, "_diag_file_path"):
@@ -565,18 +578,27 @@ class LossFreeTopAnyRouter(Router):
             default_path = os.path.join("logs", f"lossfree_diag_{run_name}.csv")
             self._diag_file_path = os.environ.get("LOSSFREE_DIAG_FILE", default_path)
             self._diag_call_count = 0
+            # Subsampling: log every call for first DENSE_PHASE, then every STRIDE.
+            # Bounds CSV to ~1k–2k rows over a 16h run.
+            self._diag_dense_phase = int(os.environ.get("LOSSFREE_DIAG_DENSE", "200"))
+            self._diag_stride = int(os.environ.get("LOSSFREE_DIAG_STRIDE", "50"))
             try:
                 os.makedirs(os.path.dirname(self._diag_file_path) or ".", exist_ok=True)
                 with open(self._diag_file_path, "w") as f:
                     f.write(
-                        "call,k_mean,k_std,k_min,k_max,no_expert_frac,"
+                        "call,layer_number,k_mean,k_std,k_min,k_max,no_expert_frac,"
                         "threshold_mean,threshold_std,threshold_abs_max,"
                         "threshold_delta_abs_mean,threshold_delta_abs_max,"
                         "expert_load_max_over_mean,expert_load_min_over_mean,"
                         "expert_load_dead_count,expert_load_hot_count,"
                         "target_K,update_rate,update_mode,num_experts\n"
                     )
-                print(f"[LossFreeTopAnyRouter] diagnostic CSV: {self._diag_file_path}")
+                abs_path = os.path.abspath(self._diag_file_path)
+                print(
+                    f"[LossFreeTopAnyRouter] diagnostic CSV initialized at: {abs_path} "
+                    f"(logging from layer_number={self.layer_number}, rank=0)",
+                    flush=True,
+                )
             except Exception as e:
                 print(f"[LossFreeTopAnyRouter] failed to open diag file: {e}")
                 self._diag_file_path = None
@@ -585,6 +607,11 @@ class LossFreeTopAnyRouter(Router):
             return
 
         self._diag_call_count += 1
+
+        # Subsample: dense for first N calls, then every STRIDE-th call.
+        c = self._diag_call_count
+        if c > self._diag_dense_phase and (c - self._diag_dense_phase) % self._diag_stride != 0:
+            return
 
         # All work in fp32 + .item() to avoid keeping CUDA refs in the CSV path
         K_f = K.detach().float()
@@ -596,6 +623,7 @@ class LossFreeTopAnyRouter(Router):
 
         row = [
             self._diag_call_count,
+            self.layer_number,
             K_f.mean().item(),
             K_f.std().item(),
             K_f.min().item(),
