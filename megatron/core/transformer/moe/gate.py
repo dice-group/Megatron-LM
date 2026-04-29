@@ -224,24 +224,43 @@ class TopAnyRouter(Router):
             soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
         ).to(input.dtype)
 
-        # --- Auxiliary load-balancing loss ---
+        # --- Auxiliary losses (load balance + optional K-target) ---
         if self.training and torch.is_grad_enabled():
-            aux_loss_coeff = self.config.moe_aux_loss_coeff
-            if aux_loss_coeff is not None and aux_loss_coeff > 0:
-                # Quadratic load-balance loss: l_aux ∝ k²
-                exp_counts = gates.sum(dim=0)  # [num_experts]
-                non_zero_count = (K > 0).sum().clamp(min=1).float()
-                me = exp_counts / non_zero_count
-                l_aux = (
-                    aux_loss_coeff
-                    * torch.mean(me * me)
-                    * self.num_experts
-                    * self.num_experts
+            aux_loss_coeff = self.config.moe_aux_loss_coeff or 0.0
+            # K-target loss: coeff · (K̄ − target_K)². Gradient flows through
+            # STE → scores → gate_thresholds, directly anchoring K.mean() to
+            # the target. Env-controlled to keep the routing config simple.
+            k_tgt_coeff = float(os.environ.get("TOPANY_K_TARGET_COEFF", "0"))
+            k_tgt_value = float(os.environ.get("TOPANY_K_TARGET", "2.0"))
+
+            # --- Unified sweep CSV ---
+            with torch.no_grad():
+                ec_diag = gates.sum(dim=0).float()
+                ec_mean_diag = ec_diag.mean().clamp_min(1e-6)
+                non_zero_count_diag = (K > 0).sum().clamp(min=1).float()
+                me_diag = ec_diag / non_zero_count_diag
+                l_lb_raw = (me_diag.mul(me_diag).mean() * self.num_experts * self.num_experts).item()
+                l_kt_raw = ((K.float().mean() - k_tgt_value) ** 2).item()
+                t_diag = self.gate_thresholds.detach().float()
+                _sweep_diag_log(
+                    self.layer_number,
+                    routing_type="topany",
+                    k_mean=K.float().mean().item(),
+                    k_std=K.float().std().item(),
+                    k_max=K.float().max().item(),
+                    no_expert_frac=no_expert_mask.float().mean().item(),
+                    load_max_over_mean=(ec_diag.max() / ec_mean_diag).item(),
+                    load_min_over_mean=(ec_diag.min() / ec_mean_diag).item(),
+                    dead_count=(ec_diag < 0.1 * ec_mean_diag).sum().item(),
+                    threshold_mean=t_diag.mean().item(),
+                    threshold_abs_max=t_diag.abs().max().item(),
+                    aux_loss_lb=l_lb_raw,
+                    aux_loss_kt=l_kt_raw,
+                    target_K=k_tgt_value,
+                    num_experts=self.num_experts,
                 )
 
-                probs = MoEAuxLossAutoScaler.apply(probs, l_aux)
-
-                # Log the aux loss
+            if aux_loss_coeff > 0 or k_tgt_coeff > 0:
                 num_layers = self.config.num_layers
                 if self.config.mtp_num_layers is not None:
                     num_layers += self.config.mtp_num_layers
@@ -249,13 +268,39 @@ class TopAnyRouter(Router):
                 if self.is_mtp_layer:
                     layer_number = self.layer_number + self.config.num_layers
 
-                save_to_aux_losses_tracker(
-                    "load_balancing_loss",
-                    l_aux / aux_loss_coeff,
-                    layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
+                total_aux = torch.zeros((), device=probs.device, dtype=probs.dtype)
+
+                if aux_loss_coeff > 0:
+                    exp_counts = gates.sum(dim=0)
+                    non_zero_count = (K > 0).sum().clamp(min=1).float()
+                    me = exp_counts / non_zero_count
+                    l_aux = (
+                        aux_loss_coeff
+                        * torch.mean(me * me)
+                        * self.num_experts
+                        * self.num_experts
+                    )
+                    total_aux = total_aux + l_aux.to(probs.dtype)
+                    save_to_aux_losses_tracker(
+                        "load_balancing_loss",
+                        l_aux.detach() / aux_loss_coeff,
+                        layer_number,
+                        num_layers,
+                        reduce_group=self.tp_cp_group,
+                    )
+
+                if k_tgt_coeff > 0:
+                    l_k = k_tgt_coeff * ((K.float().mean() - k_tgt_value) ** 2)
+                    total_aux = total_aux + l_k.to(probs.dtype)
+                    save_to_aux_losses_tracker(
+                        "k_target_loss",
+                        l_k.detach() / k_tgt_coeff,
+                        layer_number,
+                        num_layers,
+                        reduce_op="replace",
+                    )
+
+                probs = MoEAuxLossAutoScaler.apply(probs, total_aux)
 
         return probs, routing_map
 
@@ -264,7 +309,80 @@ class TopAnyRouter(Router):
         raise NotImplementedError("TopAnyRouter uses forward() directly, not routing().")
 
 
-_DIAG_LOGGER_LAYER = None  # First LossFreeTopAnyRouter instance to log claims this; others skip.
+_SWEEP_DIAG_COLUMNS = (
+    "run_name", "routing_type", "call",
+    "k_mean", "k_std", "k_max", "no_expert_frac",
+    "load_max_over_mean", "load_min_over_mean", "dead_count",
+    "threshold_mean", "threshold_abs_max", "threshold_delta_abs_max",
+    "aux_loss_lb", "aux_loss_kt",
+    "target_K", "update_rate", "update_mode", "num_experts",
+)
+# Unified diagnostic-CSV state: shared across all router types in this process.
+# First (rank-0, training) router instance to call _sweep_diag_log claims it;
+# everyone else returns immediately. Subsamples to keep total rows bounded.
+_SWEEP_DIAG = {
+    "claimed_layer": None,
+    "path": None,
+    "call_count": 0,
+    "dense_phase": int(os.environ.get("SWEEP_DIAG_DENSE", "50")),
+    "stride": int(os.environ.get("SWEEP_DIAG_STRIDE", "200")),
+    "initialized": False,
+}
+
+
+def _sweep_diag_log(layer_number: int, **fields) -> None:
+    """Append one row to the unified sweep CSV.
+
+    Schema: _SWEEP_DIAG_COLUMNS. Missing fields render as empty strings
+    (e.g. lossfree leaves aux_loss_*; topany leaves threshold_delta_*).
+    Only writes from rank 0 + first-instance-to-claim-this-layer.
+    """
+    state = _SWEEP_DIAG
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+
+    if state["claimed_layer"] is None:
+        state["claimed_layer"] = layer_number
+    if layer_number != state["claimed_layer"]:
+        return
+
+    if not state["initialized"]:
+        state["initialized"] = True
+        run_name = os.environ.get("RUN_NAME", "unknown")
+        default = os.path.join("logs", f"sweep_diag_{run_name}.csv")
+        state["path"] = os.environ.get("SWEEP_DIAG_FILE", default)
+        try:
+            os.makedirs(os.path.dirname(state["path"]) or ".", exist_ok=True)
+            with open(state["path"], "w") as f:
+                f.write(",".join(_SWEEP_DIAG_COLUMNS) + "\n")
+            print(
+                f"[SweepDiag] CSV: {os.path.abspath(state['path'])} "
+                f"(layer={layer_number}, dense={state['dense_phase']}, stride={state['stride']})",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[SweepDiag] init failed: {e}")
+            state["path"] = None
+
+    if state["path"] is None:
+        return
+
+    state["call_count"] += 1
+    c = state["call_count"]
+    if c > state["dense_phase"] and (c - state["dense_phase"]) % state["stride"] != 0:
+        return
+
+    fields["call"] = c
+    fields.setdefault("run_name", os.environ.get("RUN_NAME", "unknown"))
+
+    try:
+        with open(state["path"], "a") as f:
+            f.write(",".join(str(fields.get(col, "")) for col in _SWEEP_DIAG_COLUMNS) + "\n")
+    except Exception as e:
+        if c <= 3:
+            print(f"[SweepDiag] write failed: {e}")
 
 
 class LossFreeTopAnyRouter(Router):
@@ -545,11 +663,26 @@ class LossFreeTopAnyRouter(Router):
                         layer_number_d, num_layers_d, reduce_op="replace",
                     )
 
-                # --- Diagnostic CSV (rank 0, layer 0 only, append per call) ---
-                self._append_diag_row(
-                    K=K, no_expert_mask=no_expert_mask, gates=gates,
-                    delta=delta, t=self._fp32_thresholds, num_tokens=num_tokens,
-                    target_c=target_c,
+                # --- Unified sweep CSV (rank-0 + first-claimed-layer only) ---
+                ec = gates.sum(dim=0).float()
+                ec_mean = ec.mean().clamp_min(1e-6)
+                _sweep_diag_log(
+                    self.layer_number,
+                    routing_type="lossfree",
+                    k_mean=K.float().mean().item(),
+                    k_std=K.float().std().item(),
+                    k_max=K.float().max().item(),
+                    no_expert_frac=no_expert_mask.float().mean().item(),
+                    load_max_over_mean=(ec.max() / ec_mean).item(),
+                    load_min_over_mean=(ec.min() / ec_mean).item(),
+                    dead_count=(ec < 0.1 * ec_mean).sum().item(),
+                    threshold_mean=self._fp32_thresholds.mean().item(),
+                    threshold_abs_max=self._fp32_thresholds.abs().max().item(),
+                    threshold_delta_abs_max=delta.abs().max().item(),
+                    target_K=self.target_K,
+                    update_rate=self.update_rate,
+                    update_mode=self.threshold_update_mode,
+                    num_experts=self.num_experts,
                 )
 
         # --- Build Megatron-Core compatible outputs ---
@@ -568,105 +701,3 @@ class LossFreeTopAnyRouter(Router):
         """Not used — Top-Any routing is handled entirely in forward()."""
         raise NotImplementedError("LossFreeTopAnyRouter uses forward() directly, not routing().")
 
-    def _append_diag_row(self, K, no_expert_mask, gates, delta, t, num_tokens, target_c):
-        """Append a single diagnostic row to a CSV file.
-
-        Only rank 0, only the first LossFreeTopAnyRouter instance to enter this
-        function (claims via module-global _DIAG_LOGGER_LAYER). One row per
-        forward call from that one layer. Path: $LOSSFREE_DIAG_FILE or
-        logs/lossfree_diag_<RUN_NAME>.csv (relative to cwd).
-
-        Note: Megatron's layer_number is 1-indexed and depends on PP offset, so
-        we don't filter by a hardcoded number — we just take the first one.
-        """
-        global _DIAG_LOGGER_LAYER
-
-        # Rank gate first (cheapest)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            if torch.distributed.get_rank() != 0:
-                return
-
-        # Layer gate: first instance to reach here on rank 0 owns logging
-        if _DIAG_LOGGER_LAYER is None:
-            _DIAG_LOGGER_LAYER = self.layer_number
-        if self.layer_number != _DIAG_LOGGER_LAYER:
-            return
-
-        # Initialize file on first call
-        if not hasattr(self, "_diag_file_path"):
-            run_name = os.environ.get("RUN_NAME", "unknown")
-            default_path = os.path.join("logs", f"lossfree_diag_{run_name}.csv")
-            self._diag_file_path = os.environ.get("LOSSFREE_DIAG_FILE", default_path)
-            self._diag_call_count = 0
-            # Subsampling: log every call for first DENSE_PHASE, then every STRIDE.
-            # Bounds CSV to ~1k–2k rows over a 16h run.
-            self._diag_dense_phase = int(os.environ.get("LOSSFREE_DIAG_DENSE", "200"))
-            self._diag_stride = int(os.environ.get("LOSSFREE_DIAG_STRIDE", "50"))
-            try:
-                os.makedirs(os.path.dirname(self._diag_file_path) or ".", exist_ok=True)
-                with open(self._diag_file_path, "w") as f:
-                    f.write(
-                        "call,layer_number,k_mean,k_std,k_min,k_max,no_expert_frac,"
-                        "threshold_mean,threshold_std,threshold_abs_max,"
-                        "threshold_delta_abs_mean,threshold_delta_abs_max,"
-                        "expert_load_max_over_mean,expert_load_min_over_mean,"
-                        "expert_load_dead_count,expert_load_hot_count,"
-                        "target_K,update_rate,update_mode,num_experts\n"
-                    )
-                abs_path = os.path.abspath(self._diag_file_path)
-                print(
-                    f"[LossFreeTopAnyRouter] diagnostic CSV initialized at: {abs_path} "
-                    f"(logging from layer_number={self.layer_number}, rank=0)",
-                    flush=True,
-                )
-            except Exception as e:
-                print(f"[LossFreeTopAnyRouter] failed to open diag file: {e}")
-                self._diag_file_path = None
-
-        if self._diag_file_path is None:
-            return
-
-        self._diag_call_count += 1
-
-        # Subsample: dense for first N calls, then every STRIDE-th call.
-        c = self._diag_call_count
-        if c > self._diag_dense_phase and (c - self._diag_dense_phase) % self._diag_stride != 0:
-            return
-
-        # All work in fp32 + .item() to avoid keeping CUDA refs in the CSV path
-        K_f = K.detach().float()
-        ec = gates.sum(dim=0).detach().float()
-        ec_mean = ec.mean().clamp_min(1e-6)
-        # "Dead" = <10% of mean load. "Hot" = >2x mean load. Cheap stability proxies.
-        dead = (ec < 0.1 * ec_mean).sum().item()
-        hot = (ec > 2.0 * ec_mean).sum().item()
-
-        row = [
-            self._diag_call_count,
-            self.layer_number,
-            K_f.mean().item(),
-            K_f.std().item(),
-            K_f.min().item(),
-            K_f.max().item(),
-            no_expert_mask.float().mean().item(),
-            t.mean().item(),
-            t.std().item(),
-            t.abs().max().item(),
-            delta.abs().mean().item(),
-            delta.abs().max().item(),
-            (ec.max() / ec_mean).item(),
-            (ec.min() / ec_mean).item(),
-            dead,
-            hot,
-            self.target_K,
-            self.update_rate,
-            self.threshold_update_mode,
-            self.num_experts,
-        ]
-        try:
-            with open(self._diag_file_path, "a") as f:
-                f.write(",".join(str(x) for x in row) + "\n")
-        except Exception as e:
-            # Don't crash training over diagnostic logging
-            if self._diag_call_count <= 3:
-                print(f"[LossFreeTopAnyRouter] diag write failed: {e}")
