@@ -513,8 +513,19 @@ class LossFreeTopAnyRouter(Router):
                 else:  # "magnitude"
                     # Normalize by target_c so the update rate is independent of
                     # batch size, world size, and number of experts.
-                    delta = self.update_rate * (e_i / target_c)
+                    # Clamp to [-1, 1]: e_i/target_c is bounded below at -1
+                    # (zero tokens) but unbounded above (one expert can take
+                    # ~num_experts × target_c tokens), which biases the
+                    # controller upward and lets a single hot batch step the
+                    # threshold by rate × (E-1). With the clamp, |delta| ≤ rate.
+                    delta = self.update_rate * (e_i / target_c).clamp_(-1.0, 1.0)
                 self._fp32_thresholds += delta
+                # Anti-windup: clamp to the sigmoid-non-saturated range.
+                # Beyond ±3·sigmoid_target, sigmoid(threshold) is within ~0.001
+                # of {0,1} — the expert is functionally all-pass or dead, and
+                # further drift just slows recovery without changing routing.
+                _t_clip = 3.0 * self.sigmoid_target
+                self._fp32_thresholds.clamp_(-_t_clip, _t_clip)
                 self.gate_thresholds.copy_(self._fp32_thresholds)
 
                 if log_metrics:
