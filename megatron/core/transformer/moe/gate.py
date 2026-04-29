@@ -28,6 +28,11 @@ from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+# Guards against moe_utils treating exact 0.0 as "layer not written":
+# when every MoE layer reports 0.0 for a replace-reduced metric, the tracker
+# falls back to a CPU NaN tensor that mismatches the cuda accumulator → crash.
+_EPS = 1e-30
+
 # ─── STE for binary gating ──────────────────────────────────────────────────
 
 class GAMoEGateSTEBackward(torch.autograd.Function):
@@ -198,7 +203,7 @@ class TopAnyRouter(Router):
                 reduce_op="max",
             )
             save_to_aux_losses_tracker(
-                "topany_k_std", K.detach().float().std(), layer_number, num_layers,
+                "topany_k_std", K.detach().float().std() + _EPS, layer_number, num_layers,
                 reduce_op="replace",
             )
 
@@ -207,7 +212,7 @@ class TopAnyRouter(Router):
             counts = torch.bincount(k_int, minlength=self.num_experts + 1)
             for i in range(1, self.num_experts + 1):
                 save_to_aux_losses_tracker(
-                    f"topany_k_dist_{i}", counts[i].float() / num_tokens,
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
                     layer_number, num_layers, reduce_op="replace",
                 )
 
@@ -294,7 +299,7 @@ class TopAnyRouter(Router):
                     total_aux = total_aux + l_k.to(probs.dtype)
                     save_to_aux_losses_tracker(
                         "k_target_loss",
-                        l_k.detach() / k_tgt_coeff,
+                        l_k.detach() / k_tgt_coeff + _EPS,
                         layer_number,
                         num_layers,
                         reduce_op="replace",
