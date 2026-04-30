@@ -342,6 +342,7 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
+        orig_tokens_per_expert = tokens_per_expert
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -402,6 +403,20 @@ class TEGroupedMLP(MegatronModule):
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
         output_bias = None
+
+        if self.training:
+            dummy = 0.0
+            for i, count in enumerate(orig_tokens_per_expert):
+                if count == 0:
+                    for linear in [self.linear_fc1, self.linear_fc2]:
+                        if hasattr(linear, f'weight{i}'):
+                            w = getattr(linear, f'weight{i}')
+                            dummy = dummy + 0.0 * w.sum()
+                        if hasattr(linear, f'bias{i}'):
+                            b = getattr(linear, f'bias{i}')
+                            dummy = dummy + 0.0 * b.sum()
+            if isinstance(dummy, torch.Tensor):
+                output = output + dummy
 
         return output, output_bias
 
