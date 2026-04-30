@@ -343,6 +343,28 @@ class TEGroupedMLP(MegatronModule):
         """
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
         orig_tokens_per_expert = tokens_per_expert
+
+        dummy_inserted = False
+        if self.training and 0 in tokens_per_expert:
+            dummy_inserted = True
+            new_hidden_list = []
+            new_probs_list = []
+            offset = 0
+            hidden_size = permuted_local_hidden_states.shape[-1]
+            probs_shape = permuted_probs.shape[1:]
+            for count in tokens_per_expert:
+                if count > 0:
+                    new_hidden_list.append(permuted_local_hidden_states[offset:offset+count])
+                    new_probs_list.append(permuted_probs[offset:offset+count])
+                    offset += count
+                else:
+                    new_hidden_list.append(torch.zeros((1, hidden_size), dtype=permuted_local_hidden_states.dtype, device=permuted_local_hidden_states.device))
+                    new_probs_list.append(torch.zeros((1, *probs_shape), dtype=permuted_probs.dtype, device=permuted_probs.device))
+            if new_hidden_list:
+                permuted_local_hidden_states = torch.cat(new_hidden_list, dim=0)
+                permuted_probs = torch.cat(new_probs_list, dim=0)
+            tokens_per_expert = [max(1, count) for count in tokens_per_expert]
+
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -401,22 +423,22 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
+        else:
+            actual_tokens_per_expert = tokens_per_expert
+
+        if dummy_inserted:
+            final_output_list = []
+            offset = 0
+            for orig_count, padded_count in zip(orig_tokens_per_expert, actual_tokens_per_expert):
+                if orig_count > 0:
+                    final_output_list.append(output[offset:offset+orig_count])
+                offset += padded_count
+            if sum(orig_tokens_per_expert) == 0:
+                output = torch.empty((0, output.shape[-1]), dtype=output.dtype, device=output.device)
+            else:
+                output = torch.cat(final_output_list, dim=0)
 
         output_bias = None
-
-        if self.training:
-            dummy = 0.0
-            for i, count in enumerate(orig_tokens_per_expert):
-                if count == 0:
-                    for linear in [self.linear_fc1, self.linear_fc2]:
-                        if hasattr(linear, f'weight{i}'):
-                            w = getattr(linear, f'weight{i}')
-                            dummy = dummy + 0.0 * w.sum()
-                        if hasattr(linear, f'bias{i}'):
-                            b = getattr(linear, f'bias{i}')
-                            dummy = dummy + 0.0 * b.sum()
-            if isinstance(dummy, torch.Tensor):
-                output = output + dummy
 
         return output, output_bias
 
