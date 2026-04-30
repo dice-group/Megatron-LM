@@ -171,15 +171,18 @@ class TopAnyRouter(Router):
         # --- Binary decision via STE ---
         gates = GAMoEGateSTEBackward.apply(scores)  # [num_tokens, num_experts], 0.0 or 1.0
 
-        # --- Guarantee at least one expert per token ---
+        # --- Optionally guarantee at least one expert per token ---
+        # TOPANY_FORCE_TOP1=1 (default): tokens with K=0 fall back to top-1.
+        # TOPANY_FORCE_TOP1=0: tokens with K=0 skip MoE entirely (residual passthrough).
         exp_counts_per_token = gates.sum(dim=1)  # [num_tokens]
         no_expert_mask = (exp_counts_per_token == 0)  # [num_tokens] bool
 
-        top1_idx = pre_sigmoid.argmax(dim=1)  # [num_tokens]
-        gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
-
-        # Per-token expert count K (for weight normalization)
-        K = exp_counts_per_token + no_expert_mask.float()  # [num_tokens]
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")):
+            top1_idx = pre_sigmoid.argmax(dim=1)
+            gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
+            K = exp_counts_per_token + no_expert_mask.float()
+        else:
+            K = exp_counts_per_token
 
         # --- Log K stats (experts-per-token) ---
         if self.training and torch.is_grad_enabled():
@@ -529,13 +532,15 @@ class LossFreeTopAnyRouter(Router):
         # --- Binary decision via STE ---
         gates = GAMoEGateSTEBackward.apply(scores)
 
-        # --- Guarantee at least one expert per token ---
+        # --- Optionally guarantee at least one expert per token ---
         exp_counts_per_token = gates.sum(dim=1)
         no_expert_mask = (exp_counts_per_token == 0)
-        top1_idx = pre_sigmoid.argmax(dim=1)
-        gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
-
-        K = exp_counts_per_token + no_expert_mask.float()
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")):
+            top1_idx = pre_sigmoid.argmax(dim=1)
+            gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
+            K = exp_counts_per_token + no_expert_mask.float()
+        else:
+            K = exp_counts_per_token
 
         # --- Log K stats (experts-per-token) + threshold/fallback diagnostics ---
         if self.training and torch.is_grad_enabled():
@@ -705,4 +710,436 @@ class LossFreeTopAnyRouter(Router):
     def routing(self, logits: torch.Tensor):
         """Not used — Top-Any routing is handled entirely in forward()."""
         raise NotImplementedError("LossFreeTopAnyRouter uses forward() directly, not routing().")
+
+
+# ─── Sigmoid-Linear Top-Any Router ───────────────────────────────────────────
+#
+# Different parameterization of variable-K routing: instead of cosine similarity
+# with learnable per-expert thresholds, use a plain Linear(d, E) → sigmoid with
+# a fixed 0.5 cutoff. The K is implicit (count of experts above 0.5). Optional
+# K-target loss + standard load-balance aux loss are inherited from TopAnyRouter.
+#
+# Decision: σ(W^T x) > 0.5  ⇔  W^T x > 0
+#
+# This drops three quirks of the cosine variant at once:
+#   1. No learnable threshold — cutoff fixed at 0.5, removes a degree of freedom
+#      the LM gradient was abusing (pushing thresholds down to dilute probs).
+#   2. No cosine normalization — linear logits can absorb both routing direction
+#      and magnitude (see LossFreeTopAnyRouter post-mortem: cosine pre-sigmoid
+#      drifted upward as sim_matrix learned, pinning thresholds at clamp).
+#   3. No scaling factor — sigmoid_target/logit_scale becomes a property of W's
+#      init scale (handled by config.init_method), not a separate hyperparam.
+
+class SigmoidGateRouter(Router):
+    """Sigmoid-Linear router with binary route/no-route decisions.
+
+    Linear(d, E) → sigmoid → STE(>0.5). Variable K per token. Standard MoE load
+    balance aux loss + optional env-controlled K-target loss.
+
+    Args:
+        config (TransformerConfig): Megatron-Core transformer configuration.
+        pg_collection (ProcessGroupCollection, optional): Process groups for MoE ops.
+        is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        # Reuse self.weight from Router.__init__ — it's the [E, d] linear we want.
+        # Drop the trainable bias; cutoff is fixed at logit=0 (σ=0.5).
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
+
+        print(
+            f"[SigmoidGateRouter] initialized: {self.num_experts} experts, "
+            f"hidden_size={config.hidden_size}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        original_shape = input.shape
+        input_2d = input.view(-1, original_shape[-1])
+        num_tokens = input_2d.shape[0]
+
+        # Linear logits via base-class gating (handles dtype, device).
+        logits = self.gating(input_2d).float()  # [num_tokens, num_experts]
+
+        raw_logits = torch.sigmoid(logits)
+        scores = raw_logits - 0.5  # cutoff at 0.5 ⇔ logit > 0
+        gates = GAMoEGateSTEBackward.apply(scores)  # [num_tokens, num_experts]
+
+        # --- Optionally guarantee at least one expert per token ---
+        exp_counts_per_token = gates.sum(dim=1)
+        no_expert_mask = (exp_counts_per_token == 0)
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")):
+            top1_idx = logits.argmax(dim=1)
+            gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
+            K = exp_counts_per_token + no_expert_mask.float()
+        else:
+            K = exp_counts_per_token
+
+        # --- Log K stats ---
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K.detach().float().std() + _EPS, layer_number, num_layers,
+                reduce_op="replace",
+            )
+
+            k_int = K.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_experts + 1)
+            for i in range(1, self.num_experts + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
+                    layer_number, num_layers, reduce_op="replace",
+                )
+
+        routing_map = gates.bool()
+        soft_weights = raw_logits * gates
+        probs = (
+            soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        ).to(input.dtype)
+
+        # --- Aux losses + sweep CSV ---
+        if self.training and torch.is_grad_enabled():
+            aux_loss_coeff = self.config.moe_aux_loss_coeff or 0.0
+            k_tgt_coeff = float(os.environ.get("TOPANY_K_TARGET_COEFF", "0"))
+            k_tgt_value = float(os.environ.get("TOPANY_K_TARGET", "2.0"))
+
+            with torch.no_grad():
+                ec_diag = gates.sum(dim=0).float()
+                ec_mean_diag = ec_diag.mean().clamp_min(1e-6)
+                non_zero_count_diag = (K > 0).sum().clamp(min=1).float()
+                me_diag = ec_diag / non_zero_count_diag
+                l_lb_raw = (me_diag.mul(me_diag).mean() * self.num_experts * self.num_experts).item()
+                l_kt_raw = ((K.float().mean() - k_tgt_value) ** 2).item()
+                # threshold_* fields don't apply (fixed 0.5 cutoff). Logit stats
+                # go in their place so the sweep CSV stays usefully populated.
+                logit_diag = logits.detach().float()
+                _sweep_diag_log(
+                    self.layer_number,
+                    routing_type="sigmoid",
+                    k_mean=K.float().mean().item(),
+                    k_std=K.float().std().item(),
+                    k_max=K.float().max().item(),
+                    no_expert_frac=no_expert_mask.float().mean().item(),
+                    load_max_over_mean=(ec_diag.max() / ec_mean_diag).item(),
+                    load_min_over_mean=(ec_diag.min() / ec_mean_diag).item(),
+                    dead_count=(ec_diag < 0.1 * ec_mean_diag).sum().item(),
+                    threshold_mean=logit_diag.mean().item(),
+                    threshold_abs_max=logit_diag.abs().max().item(),
+                    aux_loss_lb=l_lb_raw,
+                    aux_loss_kt=l_kt_raw,
+                    target_K=k_tgt_value,
+                    num_experts=self.num_experts,
+                )
+
+            if aux_loss_coeff > 0 or k_tgt_coeff > 0:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+                layer_number = self.layer_number
+                if self.is_mtp_layer:
+                    layer_number = self.layer_number + self.config.num_layers
+
+                total_aux = torch.zeros((), device=probs.device, dtype=probs.dtype)
+
+                if aux_loss_coeff > 0:
+                    exp_counts = gates.sum(dim=0)
+                    non_zero_count = (K > 0).sum().clamp(min=1).float()
+                    me = exp_counts / non_zero_count
+                    l_aux = (
+                        aux_loss_coeff
+                        * torch.mean(me * me)
+                        * self.num_experts
+                        * self.num_experts
+                    )
+                    total_aux = total_aux + l_aux.to(probs.dtype)
+                    save_to_aux_losses_tracker(
+                        "load_balancing_loss",
+                        l_aux.detach() / aux_loss_coeff,
+                        layer_number,
+                        num_layers,
+                        reduce_group=self.tp_cp_group,
+                    )
+
+                if k_tgt_coeff > 0:
+                    l_k = k_tgt_coeff * ((K.float().mean() - k_tgt_value) ** 2)
+                    total_aux = total_aux + l_k.to(probs.dtype)
+                    save_to_aux_losses_tracker(
+                        "k_target_loss",
+                        l_k.detach() / k_tgt_coeff + _EPS,
+                        layer_number,
+                        num_layers,
+                        reduce_op="replace",
+                    )
+
+                probs = MoEAuxLossAutoScaler.apply(probs, total_aux)
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Not used — handled entirely in forward()."""
+        raise NotImplementedError("SigmoidGateRouter uses forward() directly, not routing().")
+
+
+class LossFreeSigmoidRouter(Router):
+    """Loss-Free Sigmoid-Linear router with per-expert bias balancing.
+
+    Linear(d, E) → sigmoid(logit + b_e) → STE(>0.5), where b_e is a per-expert
+    bias buffer (NOT a parameter) updated outside autograd to balance load:
+    overloaded experts get b_e ↓, underloaded get b_e ↑.
+
+    Equivalent to LossFreeTopAnyRouter's threshold mechanism but on a linear
+    pre-activation. Should avoid the cosine-LF failure mode where pre_sigmoid
+    drifted upward as sim_matrix learned (linear weights absorb that drift).
+
+    Args:
+        config (TransformerConfig): Megatron-Core transformer configuration.
+        pg_collection (ProcessGroupCollection, optional): Process groups for MoE ops.
+        is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+        target_K (float): Desired average number of experts per token (e.g., 2.0).
+        update_rate (float): Step size for per-expert bias updates.
+        threshold_update_mode (str): "sign" or "magnitude" (kept named for env-var
+            compatibility with the cosine LF router; controls bias updates here).
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        target_K: Optional[float] = None,
+        update_rate: Optional[float] = None,
+        threshold_update_mode: Optional[str] = None,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
+
+        num_experts = config.num_moe_experts
+
+        self.target_K = target_K if target_K is not None else getattr(
+            config, 'moe_topany_target_k', 2.0
+        )
+        self.update_rate = update_rate if update_rate is not None else getattr(
+            config, 'moe_topany_update_rate', 0.01
+        )
+        self.threshold_update_mode = threshold_update_mode if threshold_update_mode is not None else getattr(
+            config, 'moe_topany_threshold_update_mode', 'sign'
+        )
+        assert self.threshold_update_mode in ("sign", "magnitude"), (
+            f"Unknown threshold_update_mode '{self.threshold_update_mode}'. Expected 'sign' or 'magnitude'."
+        )
+
+        # Per-expert bias on the pre-sigmoid logit. Buffer (not a parameter)
+        # so it doesn't get gradient updates. Init at 0 (decision boundary at
+        # logit=0 ⇔ σ=0.5 ⇔ no bias).
+        self.register_buffer("lf_bias", torch.zeros(num_experts))
+        # High-precision shadow tensor (mixed-precision can cast the buffer).
+        self._fp32_lf_bias = None
+
+        print(
+            f"[LossFreeSigmoidRouter] initialized: {num_experts} experts, "
+            f"hidden_size={config.hidden_size}, target_K={self.target_K}, "
+            f"update_rate={self.update_rate}, mode={self.threshold_update_mode}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        original_shape = input.shape
+        input_2d = input.view(-1, original_shape[-1])
+        num_tokens = input_2d.shape[0]
+
+        logits = self.gating(input_2d).float()  # [num_tokens, num_experts]
+
+        if self._fp32_lf_bias is None or self._fp32_lf_bias.device != input.device:
+            self._fp32_lf_bias = self.lf_bias.clone().float().to(input.device)
+
+        biased_logits = logits + self._fp32_lf_bias.detach().unsqueeze(0)
+        raw_logits = torch.sigmoid(biased_logits)
+        scores = raw_logits - 0.5
+        gates = GAMoEGateSTEBackward.apply(scores)
+
+        # --- Optionally guarantee at least one expert per token ---
+        exp_counts_per_token = gates.sum(dim=1)
+        no_expert_mask = (exp_counts_per_token == 0)
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")):
+            top1_idx = biased_logits.argmax(dim=1)
+            gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
+            K = exp_counts_per_token + no_expert_mask.float()
+        else:
+            K = exp_counts_per_token
+
+        # --- Log K stats + bias diagnostics ---
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K.detach().float().std() + _EPS, layer_number, num_layers,
+                reduce_op="replace",
+            )
+
+            k_int = K.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_experts + 1)
+            for i in range(1, self.num_experts + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
+                    layer_number, num_layers, reduce_op="replace",
+                )
+
+            b = self._fp32_lf_bias.detach()
+            save_to_aux_losses_tracker(
+                "threshold_mean", b.mean() + _EPS, layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "threshold_abs_max", b.abs().max() + _EPS, layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "no_expert_fallback_frac",
+                no_expert_mask.float().mean() + _EPS, layer_number, num_layers, reduce_op="replace",
+            )
+            ec = gates.sum(dim=0).detach().float()
+            ec_mean = ec.mean().clamp_min(1e-6)
+            save_to_aux_losses_tracker(
+                "expert_load_max_over_mean", ec.max() / ec_mean + _EPS,
+                layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "expert_load_min_over_mean", ec.min() / ec_mean + _EPS,
+                layer_number, num_layers, reduce_op="replace",
+            )
+
+        # --- Bias update (loss-free balancing, outside autograd) ---
+        if self.training:
+            log_metrics = torch.is_grad_enabled()
+            with torch.no_grad():
+                actual_c = gates.sum(dim=0).float()
+                group = self.tp_dp_cp_group
+                world_size = (
+                    torch.distributed.get_world_size(group)
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        and group is not None
+                    )
+                    else 1
+                )
+                if world_size > 1:
+                    torch.distributed.all_reduce(actual_c, group=group)
+
+                global_num_tokens = num_tokens * world_size
+                target_c = (global_num_tokens * self.target_K) / self.num_experts
+                e_i = actual_c - target_c
+
+                # Sign-flipped vs LossFreeTopAnyRouter: there, threshold↑ ⇒ less
+                # selected. Here, bias↑ ⇒ MORE selected (logit + bias goes up).
+                # So overloaded (e_i > 0) needs bias DOWN.
+                if self.threshold_update_mode == "sign":
+                    delta = -self.update_rate * torch.sign(e_i)
+                else:  # "magnitude"
+                    delta = -self.update_rate * (e_i / target_c).clamp_(-1.0, 1.0)
+
+                self._fp32_lf_bias += delta
+                # Anti-windup: σ(±9) saturates within ~0.0001 of {0,1}; further
+                # drift just slows recovery without changing routing.
+                self._fp32_lf_bias.clamp_(-9.0, 9.0)
+                self.lf_bias.copy_(self._fp32_lf_bias)
+
+                if log_metrics:
+                    num_layers_d = self.config.num_layers
+                    if self.config.mtp_num_layers is not None:
+                        num_layers_d += self.config.mtp_num_layers
+                    layer_number_d = self.layer_number
+                    if self.is_mtp_layer:
+                        layer_number_d = self.layer_number + self.config.num_layers
+                    save_to_aux_losses_tracker(
+                        "threshold_delta_abs_mean", delta.abs().mean() + _EPS,
+                        layer_number_d, num_layers_d, reduce_op="replace",
+                    )
+                    save_to_aux_losses_tracker(
+                        "threshold_delta_abs_max", delta.abs().max() + _EPS,
+                        layer_number_d, num_layers_d, reduce_op="replace",
+                    )
+
+                # --- Sweep CSV ---
+                ec = gates.sum(dim=0).float()
+                ec_mean = ec.mean().clamp_min(1e-6)
+                _sweep_diag_log(
+                    self.layer_number,
+                    routing_type="sigmoid_lossfree",
+                    k_mean=K.float().mean().item(),
+                    k_std=K.float().std().item(),
+                    k_max=K.float().max().item(),
+                    no_expert_frac=no_expert_mask.float().mean().item(),
+                    load_max_over_mean=(ec.max() / ec_mean).item(),
+                    load_min_over_mean=(ec.min() / ec_mean).item(),
+                    dead_count=(ec < 0.1 * ec_mean).sum().item(),
+                    threshold_mean=self._fp32_lf_bias.mean().item(),
+                    threshold_abs_max=self._fp32_lf_bias.abs().max().item(),
+                    threshold_delta_abs_max=delta.abs().max().item(),
+                    target_K=self.target_K,
+                    update_rate=self.update_rate,
+                    update_mode=self.threshold_update_mode,
+                    num_experts=self.num_experts,
+                )
+
+        routing_map = gates.bool()
+        soft_weights = raw_logits * gates
+        probs = (
+            soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        ).to(input.dtype)
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Not used — handled entirely in forward()."""
+        raise NotImplementedError("LossFreeSigmoidRouter uses forward() directly, not routing().")
 
