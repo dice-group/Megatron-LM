@@ -466,6 +466,11 @@ def unpermute(
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    if permuted_tokens.numel() == 0:
+        return torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
