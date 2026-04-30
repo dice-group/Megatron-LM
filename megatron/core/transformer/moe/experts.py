@@ -434,7 +434,7 @@ class TEGroupedMLP(MegatronModule):
                     final_output_list.append(output[offset:offset+orig_count])
                 offset += padded_count
             if sum(orig_tokens_per_expert) == 0:
-                output = torch.empty((0, output.shape[-1]), dtype=output.dtype, device=output.device)
+                output = output[:0]
             else:
                 output = torch.cat(final_output_list, dim=0)
 

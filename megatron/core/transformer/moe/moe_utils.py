@@ -467,7 +467,7 @@ def unpermute(
         torch.Tensor: The tokens restored to their original order.
     """
     if permuted_tokens.numel() == 0:
-        return torch.zeros(
+        return permuted_tokens.sum() * 0.0 + torch.zeros(
             restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
         )
 
