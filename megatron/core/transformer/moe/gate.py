@@ -242,31 +242,33 @@ class TopAnyRouter(Router):
             k_tgt_value = float(os.environ.get("TOPANY_K_TARGET", "2.0"))
 
             # --- Unified sweep CSV ---
-            with torch.no_grad():
-                ec_diag = gates.sum(dim=0).float()
-                ec_mean_diag = ec_diag.mean().clamp_min(1e-6)
-                non_zero_count_diag = (K > 0).sum().clamp(min=1).float()
-                me_diag = ec_diag / non_zero_count_diag
-                l_lb_raw = (me_diag.mul(me_diag).mean() * self.num_experts * self.num_experts).item()
-                l_kt_raw = ((K.float().mean() - k_tgt_value) ** 2).item()
-                t_diag = self.gate_thresholds.detach().float()
-                _sweep_diag_log(
-                    self.layer_number,
-                    routing_type="topany",
-                    k_mean=K.float().mean().item(),
-                    k_std=K.float().std().item(),
-                    k_max=K.float().max().item(),
-                    no_expert_frac=no_expert_mask.float().mean().item(),
-                    load_max_over_mean=(ec_diag.max() / ec_mean_diag).item(),
-                    load_min_over_mean=(ec_diag.min() / ec_mean_diag).item(),
-                    dead_count=(ec_diag < 0.1 * ec_mean_diag).sum().item(),
-                    threshold_mean=t_diag.mean().item(),
-                    threshold_abs_max=t_diag.abs().max().item(),
-                    aux_loss_lb=l_lb_raw,
-                    aux_loss_kt=l_kt_raw,
-                    target_K=k_tgt_value,
-                    num_experts=self.num_experts,
-                )
+            # Gate before the .item() calls — they each force a host sync.
+            if _sweep_diag_should_log(self.layer_number):
+                with torch.no_grad():
+                    ec_diag = gates.sum(dim=0).float()
+                    ec_mean_diag = ec_diag.mean().clamp_min(1e-6)
+                    non_zero_count_diag = (K > 0).sum().clamp(min=1).float()
+                    me_diag = ec_diag / non_zero_count_diag
+                    l_lb_raw = (me_diag.mul(me_diag).mean() * self.num_experts * self.num_experts).item()
+                    l_kt_raw = ((K.float().mean() - k_tgt_value) ** 2).item()
+                    t_diag = self.gate_thresholds.detach().float()
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="topany",
+                        k_mean=K.float().mean().item(),
+                        k_std=K.float().std().item(),
+                        k_max=K.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec_diag.max() / ec_mean_diag).item(),
+                        load_min_over_mean=(ec_diag.min() / ec_mean_diag).item(),
+                        dead_count=(ec_diag < 0.1 * ec_mean_diag).sum().item(),
+                        threshold_mean=t_diag.mean().item(),
+                        threshold_abs_max=t_diag.abs().max().item(),
+                        aux_loss_lb=l_lb_raw,
+                        aux_loss_kt=l_kt_raw,
+                        target_K=k_tgt_value,
+                        num_experts=self.num_experts,
+                    )
 
             if aux_loss_coeff > 0 or k_tgt_coeff > 0:
                 num_layers = self.config.num_layers
@@ -338,23 +340,29 @@ _SWEEP_DIAG = {
 }
 
 
-def _sweep_diag_log(layer_number: int, **fields) -> None:
-    """Append one row to the unified sweep CSV.
+def _sweep_diag_should_log(layer_number: int) -> bool:
+    """Cheap gating check — call BEFORE evaluating the host-syncing .item()
+    arguments to _sweep_diag_log. Returns True iff this call should both
+    compute the diagnostic tensors and append a CSV row.
 
-    Schema: _SWEEP_DIAG_COLUMNS. Missing fields render as empty strings
-    (e.g. lossfree leaves aux_loss_*; topany leaves threshold_delta_*).
-    Only writes from rank 0 + first-instance-to-claim-this-layer.
+    Why: callsites pass ~10 .item() values into _sweep_diag_log. Python
+    evaluates kwargs eagerly, so each .item() forces a CUDA→CPU sync —
+    even on calls that the stride filter would discard. Gating up-front
+    avoids those syncs entirely.
+
+    Maintains call_count + stride state, so write cadence is unchanged
+    versus the pre-split implementation.
     """
     state = _SWEEP_DIAG
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         if torch.distributed.get_rank() != 0:
-            return
+            return False
 
     if state["claimed_layer"] is None:
         state["claimed_layer"] = layer_number
     if layer_number != state["claimed_layer"]:
-        return
+        return False
 
     if not state["initialized"]:
         state["initialized"] = True
@@ -375,21 +383,35 @@ def _sweep_diag_log(layer_number: int, **fields) -> None:
             state["path"] = None
 
     if state["path"] is None:
-        return
+        return False
 
     state["call_count"] += 1
     c = state["call_count"]
     if c > state["dense_phase"] and (c - state["dense_phase"]) % state["stride"] != 0:
+        return False
+    return True
+
+
+def _sweep_diag_log(layer_number: int, **fields) -> None:
+    """Append one row to the unified sweep CSV. Caller must have already
+    verified _sweep_diag_should_log(layer_number) — this function does no
+    rank/layer/stride filtering itself.
+
+    Schema: _SWEEP_DIAG_COLUMNS. Missing fields render as empty strings
+    (e.g. lossfree leaves aux_loss_*; topany leaves threshold_delta_*).
+    """
+    state = _SWEEP_DIAG
+    if state["path"] is None:
         return
 
-    fields["call"] = c
+    fields["call"] = state["call_count"]
     fields.setdefault("run_name", os.environ.get("RUN_NAME", "unknown"))
 
     try:
         with open(state["path"], "a") as f:
             f.write(",".join(str(fields.get(col, "")) for col in _SWEEP_DIAG_COLUMNS) + "\n")
     except Exception as e:
-        if c <= 3:
+        if state["call_count"] <= 3:
             print(f"[SweepDiag] write failed: {e}")
 
 
@@ -674,26 +696,28 @@ class LossFreeTopAnyRouter(Router):
                     )
 
                 # --- Unified sweep CSV (rank-0 + first-claimed-layer only) ---
-                ec = gates.sum(dim=0).float()
-                ec_mean = ec.mean().clamp_min(1e-6)
-                _sweep_diag_log(
-                    self.layer_number,
-                    routing_type="lossfree",
-                    k_mean=K.float().mean().item(),
-                    k_std=K.float().std().item(),
-                    k_max=K.float().max().item(),
-                    no_expert_frac=no_expert_mask.float().mean().item(),
-                    load_max_over_mean=(ec.max() / ec_mean).item(),
-                    load_min_over_mean=(ec.min() / ec_mean).item(),
-                    dead_count=(ec < 0.1 * ec_mean).sum().item(),
-                    threshold_mean=self._fp32_thresholds.mean().item(),
-                    threshold_abs_max=self._fp32_thresholds.abs().max().item(),
-                    threshold_delta_abs_max=delta.abs().max().item(),
-                    target_K=self.target_K,
-                    update_rate=self.update_rate,
-                    update_mode=self.threshold_update_mode,
-                    num_experts=self.num_experts,
-                )
+                # Gate before the .item() calls — they each force a host sync.
+                if _sweep_diag_should_log(self.layer_number):
+                    ec = gates.sum(dim=0).float()
+                    ec_mean = ec.mean().clamp_min(1e-6)
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="lossfree",
+                        k_mean=K.float().mean().item(),
+                        k_std=K.float().std().item(),
+                        k_max=K.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec.max() / ec_mean).item(),
+                        load_min_over_mean=(ec.min() / ec_mean).item(),
+                        dead_count=(ec < 0.1 * ec_mean).sum().item(),
+                        threshold_mean=self._fp32_thresholds.mean().item(),
+                        threshold_abs_max=self._fp32_thresholds.abs().max().item(),
+                        threshold_delta_abs_max=delta.abs().max().item(),
+                        target_K=self.target_K,
+                        update_rate=self.update_rate,
+                        update_mode=self.threshold_update_mode,
+                        num_experts=self.num_experts,
+                    )
 
         # --- Build Megatron-Core compatible outputs ---
         routing_map = gates.bool()
@@ -832,33 +856,35 @@ class SigmoidGateRouter(Router):
             k_tgt_coeff = float(os.environ.get("TOPANY_K_TARGET_COEFF", "0"))
             k_tgt_value = float(os.environ.get("TOPANY_K_TARGET", "2.0"))
 
-            with torch.no_grad():
-                ec_diag = gates.sum(dim=0).float()
-                ec_mean_diag = ec_diag.mean().clamp_min(1e-6)
-                non_zero_count_diag = (K > 0).sum().clamp(min=1).float()
-                me_diag = ec_diag / non_zero_count_diag
-                l_lb_raw = (me_diag.mul(me_diag).mean() * self.num_experts * self.num_experts).item()
-                l_kt_raw = ((K.float().mean() - k_tgt_value) ** 2).item()
-                # threshold_* fields don't apply (fixed 0.5 cutoff). Logit stats
-                # go in their place so the sweep CSV stays usefully populated.
-                logit_diag = logits.detach().float()
-                _sweep_diag_log(
-                    self.layer_number,
-                    routing_type="sigmoid",
-                    k_mean=K.float().mean().item(),
-                    k_std=K.float().std().item(),
-                    k_max=K.float().max().item(),
-                    no_expert_frac=no_expert_mask.float().mean().item(),
-                    load_max_over_mean=(ec_diag.max() / ec_mean_diag).item(),
-                    load_min_over_mean=(ec_diag.min() / ec_mean_diag).item(),
-                    dead_count=(ec_diag < 0.1 * ec_mean_diag).sum().item(),
-                    threshold_mean=logit_diag.mean().item(),
-                    threshold_abs_max=logit_diag.abs().max().item(),
-                    aux_loss_lb=l_lb_raw,
-                    aux_loss_kt=l_kt_raw,
-                    target_K=k_tgt_value,
-                    num_experts=self.num_experts,
-                )
+            # Gate before the .item() calls — they each force a host sync.
+            if _sweep_diag_should_log(self.layer_number):
+                with torch.no_grad():
+                    ec_diag = gates.sum(dim=0).float()
+                    ec_mean_diag = ec_diag.mean().clamp_min(1e-6)
+                    non_zero_count_diag = (K > 0).sum().clamp(min=1).float()
+                    me_diag = ec_diag / non_zero_count_diag
+                    l_lb_raw = (me_diag.mul(me_diag).mean() * self.num_experts * self.num_experts).item()
+                    l_kt_raw = ((K.float().mean() - k_tgt_value) ** 2).item()
+                    # threshold_* fields don't apply (fixed 0.5 cutoff). Logit stats
+                    # go in their place so the sweep CSV stays usefully populated.
+                    logit_diag = logits.detach().float()
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="sigmoid",
+                        k_mean=K.float().mean().item(),
+                        k_std=K.float().std().item(),
+                        k_max=K.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec_diag.max() / ec_mean_diag).item(),
+                        load_min_over_mean=(ec_diag.min() / ec_mean_diag).item(),
+                        dead_count=(ec_diag < 0.1 * ec_mean_diag).sum().item(),
+                        threshold_mean=logit_diag.mean().item(),
+                        threshold_abs_max=logit_diag.abs().max().item(),
+                        aux_loss_lb=l_lb_raw,
+                        aux_loss_kt=l_kt_raw,
+                        target_K=k_tgt_value,
+                        num_experts=self.num_experts,
+                    )
 
             if aux_loss_coeff > 0 or k_tgt_coeff > 0:
                 num_layers = self.config.num_layers
@@ -1110,26 +1136,28 @@ class LossFreeSigmoidRouter(Router):
                     )
 
                 # --- Sweep CSV ---
-                ec = gates.sum(dim=0).float()
-                ec_mean = ec.mean().clamp_min(1e-6)
-                _sweep_diag_log(
-                    self.layer_number,
-                    routing_type="sigmoid_lossfree",
-                    k_mean=K.float().mean().item(),
-                    k_std=K.float().std().item(),
-                    k_max=K.float().max().item(),
-                    no_expert_frac=no_expert_mask.float().mean().item(),
-                    load_max_over_mean=(ec.max() / ec_mean).item(),
-                    load_min_over_mean=(ec.min() / ec_mean).item(),
-                    dead_count=(ec < 0.1 * ec_mean).sum().item(),
-                    threshold_mean=self._fp32_lf_bias.mean().item(),
-                    threshold_abs_max=self._fp32_lf_bias.abs().max().item(),
-                    threshold_delta_abs_max=delta.abs().max().item(),
-                    target_K=self.target_K,
-                    update_rate=self.update_rate,
-                    update_mode=self.threshold_update_mode,
-                    num_experts=self.num_experts,
-                )
+                # Gate before the .item() calls — they each force a host sync.
+                if _sweep_diag_should_log(self.layer_number):
+                    ec = gates.sum(dim=0).float()
+                    ec_mean = ec.mean().clamp_min(1e-6)
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="sigmoid_lossfree",
+                        k_mean=K.float().mean().item(),
+                        k_std=K.float().std().item(),
+                        k_max=K.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec.max() / ec_mean).item(),
+                        load_min_over_mean=(ec.min() / ec_mean).item(),
+                        dead_count=(ec < 0.1 * ec_mean).sum().item(),
+                        threshold_mean=self._fp32_lf_bias.mean().item(),
+                        threshold_abs_max=self._fp32_lf_bias.abs().max().item(),
+                        threshold_delta_abs_max=delta.abs().max().item(),
+                        target_K=self.target_K,
+                        update_rate=self.update_rate,
+                        update_mode=self.threshold_update_mode,
+                        num_experts=self.num_experts,
+                    )
 
         routing_map = gates.bool()
         soft_weights = raw_logits * gates

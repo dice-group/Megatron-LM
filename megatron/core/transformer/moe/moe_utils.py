@@ -1206,10 +1206,11 @@ def track_moe_metrics(
             import matplotlib
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
-            ks = [str(k) for k, _ in k_dist_data]
+            ks = [k for k, _ in k_dist_data]
             fracs = [frac for _, frac in k_dist_data]
             fig, ax = plt.subplots()
             ax.bar(ks, fracs)
+            ax.set_xticks(ks)
             ax.set_xlabel("Experts per Token")
             ax.set_ylabel("Fraction")
             ax.set_title("Experts per Token Distribution")
