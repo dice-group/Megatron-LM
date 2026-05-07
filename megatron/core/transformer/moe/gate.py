@@ -1165,6 +1165,38 @@ class LossFreeSigmoidRouter(Router):
             soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
         ).to(input.dtype)
 
+        # Optional load-balance aux loss. Off by default (loss-free balancing
+        # via the bias controller is the design). Enabling it gives the LM
+        # gradient something to push back against if the linear logits drift
+        # upward to compensate for an over-saturated negative bias.
+        if self.training and torch.is_grad_enabled():
+            aux_loss_coeff = self.config.moe_aux_loss_coeff or 0.0
+            if aux_loss_coeff > 0:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+                layer_number = self.layer_number
+                if self.is_mtp_layer:
+                    layer_number = self.layer_number + self.config.num_layers
+
+                exp_counts = gates.sum(dim=0)
+                non_zero_count = (K > 0).sum().clamp(min=1).float()
+                me = exp_counts / non_zero_count
+                l_aux = (
+                    aux_loss_coeff
+                    * torch.mean(me * me)
+                    * self.num_experts
+                    * self.num_experts
+                )
+                save_to_aux_losses_tracker(
+                    "load_balancing_loss",
+                    l_aux.detach() / aux_loss_coeff,
+                    layer_number,
+                    num_layers,
+                    reduce_group=self.tp_cp_group,
+                )
+                probs = MoEAuxLossAutoScaler.apply(probs, l_aux.to(probs.dtype))
+
         return probs, routing_map
 
     def routing(self, logits: torch.Tensor):
@@ -1671,4 +1703,503 @@ class LossFreeSigmoidAnnealRouter(LossFreeSigmoidRouter):
             self._fwd_step += 1
             self.target_K = self._current_target_K()
         return super().forward(input, padding_mask)
+
+
+# ─── ReMoE: ReLU Routing (fully differentiable) ──────────────────────────────
+#
+# Wang/Chen/Zhu 2024, arXiv:2412.14711. Unlike every other variable-K router in
+# this file, ReMoE has NO STE: gate = ReLU(W·x), so the gradient at the
+# selection boundary is well-defined. probs ARE the gate values (un-normalized,
+# per the paper) — gradient pressure for sparsity comes from a load-weighted L1
+# penalty whose coefficient λ is multiplicatively adapted to track a target
+# average-K. Paper claims consistent wins over TopK at multiple scales — the
+# only mechanism we've added that the literature reports actually beating
+# TopK on equal compute.
+
+class ReMoERouter(Router):
+    """ReLU-gated MoE router with adaptive L1 sparsity controller.
+
+    Forward: gate = ReLU(linear(x)); routing_map = (gate > 0); probs = gate
+    (NOT normalized — un-normalized gate values are what creates the gradient
+    pressure for sparsity once L1 is applied).
+
+    Sparsity control: λ_{t+1} = λ_t · (1 ± α) based on whether current average
+    K exceeds or falls below ``target_K``. Load balancing folded into the L1:
+    per-expert L1 weight = batch frequency f_e (over-used experts get pushed
+    down harder).
+
+    Args:
+        config (TransformerConfig): Megatron-Core transformer configuration.
+        pg_collection (ProcessGroupCollection, optional): Process groups.
+        is_mtp_layer (bool): MTP-layer flag.
+        target_K (float, optional): Desired average K. Env: ``REMOE_TARGET_K``.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        target_K: Optional[float] = None,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        # Drop bias — we want pure linear logits feeding the ReLU.
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
+
+        self.target_K = float(os.environ.get(
+            "REMOE_TARGET_K",
+            str(target_K if target_K is not None else
+                getattr(config, 'moe_topany_target_k', 2.0)),
+        ))
+        # Multiplicative step size for λ updates per training step.
+        self.lam_alpha = float(os.environ.get("REMOE_LAMBDA_ALPHA", "0.01"))
+        self.lam_init = float(os.environ.get("REMOE_LAMBDA_INIT", "1e-4"))
+        # Bounds keep λ in a sane range (avoid {0, ∞}).
+        self.lam_min = float(os.environ.get("REMOE_LAMBDA_MIN", "1e-8"))
+        self.lam_max = float(os.environ.get("REMOE_LAMBDA_MAX", "1.0"))
+
+        self.register_buffer("lam", torch.tensor(self.lam_init, dtype=torch.float32))
+        self._fp32_lam = None
+
+        print(
+            f"[ReMoERouter] initialized: {self.num_experts} experts, "
+            f"hidden_size={config.hidden_size}, target_K={self.target_K}, "
+            f"lam_init={self.lam_init}, lam_alpha={self.lam_alpha}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        original_shape = input.shape
+        input_2d = input.view(-1, original_shape[-1])
+        num_tokens = input_2d.shape[0]
+
+        logits = self.gating(input_2d).float()
+        gate = torch.relu(logits)  # [num_tokens, num_experts]
+        routing_map = (gate > 0)
+        K = routing_map.float().sum(dim=1)  # [num_tokens]
+
+        # FORCE_TOP1 fallback for tokens with all-negative logits.
+        no_expert_mask = (K == 0)
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")):
+            top1_idx = logits.argmax(dim=1)
+            # Insert a small positive gate value (raw logit shifted by ε) at top-1
+            # for tokens that would otherwise drop. ε ensures gradient flows.
+            fallback_val = (logits.max(dim=1).values - logits.max(dim=1).values.detach() + 1e-3)
+            mask_idx = no_expert_mask.unsqueeze(1)  # [num_tokens, 1]
+            # Build the fallback contribution as a tensor of the same shape
+            scatter_vals = torch.zeros_like(gate)
+            scatter_vals.scatter_(1, top1_idx.unsqueeze(1), fallback_val.unsqueeze(1))
+            gate = gate + scatter_vals * mask_idx.float()
+            routing_map = routing_map | (no_expert_mask.unsqueeze(1) & (
+                torch.arange(self.num_experts, device=gate.device).unsqueeze(0)
+                == top1_idx.unsqueeze(1)
+            ))
+            K = routing_map.float().sum(dim=1)
+
+        # Initialize fp32 shadow of λ on first forward.
+        if self._fp32_lam is None or self._fp32_lam.device != input.device:
+            self._fp32_lam = self.lam.clone().float().to(input.device)
+
+        # K + load diagnostics.
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K.detach().float().std() + _EPS, layer_number, num_layers,
+                reduce_op="replace",
+            )
+
+            k_int = K.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_experts + 1)
+            for i in range(1, self.num_experts + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
+                    layer_number, num_layers, reduce_op="replace",
+                )
+
+            save_to_aux_losses_tracker(
+                "remoe_lambda", self._fp32_lam.detach() + _EPS,
+                layer_number, num_layers, reduce_op="replace",
+            )
+
+        # Adaptive λ update + L1 sparsity penalty.
+        if self.training and torch.is_grad_enabled():
+            with torch.no_grad():
+                current_K = K.float().mean()
+                # Multiplicative update: λ↑ when too active, λ↓ when too sparse.
+                if current_K > self.target_K:
+                    self._fp32_lam *= (1.0 + self.lam_alpha)
+                else:
+                    self._fp32_lam *= (1.0 - self.lam_alpha)
+                self._fp32_lam.clamp_(self.lam_min, self.lam_max)
+                self.lam.copy_(self._fp32_lam)
+
+                # Per-expert load (frequency of activation), detached so it
+                # acts as a fixed weighting in the L1, not a target.
+                f = routing_map.float().mean(dim=0)  # [num_experts]
+
+            # Load-weighted L1: λ · (1/T) · Σ_t Σ_e f_e · gate_{t,e}
+            # f detached; gate is the live tensor that carries gradient.
+            l1 = self._fp32_lam * (f.unsqueeze(0) * gate).sum() / max(num_tokens, 1)
+
+            if _sweep_diag_should_log(self.layer_number):
+                with torch.no_grad():
+                    ec = routing_map.float().sum(dim=0)
+                    ec_mean = ec.mean().clamp_min(1e-6)
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="remoe",
+                        k_mean=K.float().mean().item(),
+                        k_std=K.float().std().item(),
+                        k_max=K.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec.max() / ec_mean).item(),
+                        load_min_over_mean=(ec.min() / ec_mean).item(),
+                        dead_count=(ec < 0.1 * ec_mean).sum().item(),
+                        threshold_mean=self._fp32_lam.item(),
+                        threshold_abs_max=l1.item(),
+                        target_K=self.target_K,
+                        update_rate=self.lam_alpha,
+                        update_mode="remoe_l1",
+                        num_experts=self.num_experts,
+                    )
+
+            # Apply via MoEAuxLossAutoScaler so the L1 gradient flows alongside
+            # the LM gradient through the probs path.
+            probs = gate.to(input.dtype)
+            probs = MoEAuxLossAutoScaler.apply(probs, l1.to(probs.dtype))
+        else:
+            probs = gate.to(input.dtype)
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Not used — handled entirely in forward()."""
+        raise NotImplementedError("ReMoERouter uses forward() directly, not routing().")
+
+
+# ─── AdaMoE: Top-K over (real + null) experts ────────────────────────────────
+#
+# Zeng et al. EMNLP-Findings 2024, arXiv:2406.13233. Keeps the standard topk +
+# softmax + renormalize machinery (the part that beat us in the prior sweep)
+# and just enlarges the routing space with `m` null experts that always output
+# 0. Token's effective real-K = number of real-expert slots in its top-(k+m').
+#
+# This is the diagnostic experiment: if AdaMoE matches topk (or beats it),
+# the value of variable-K is real but our previous mechanisms were the wrong
+# parameterization. If AdaMoE also loses by ~0.029 nats, variable-K is not the
+# lever at this scale.
+
+class AdaMoERouter(Router):
+    """Top-(k+m') routing over (N real + m null) experts.
+
+    Augments the standard router weight to shape [N+m, d]; selects top-(k+m')
+    by softmax probability; null indices contribute 0; remaining real picks
+    are renormalized to sum to 1. Tokens whose entire top-(k+m') was nulls
+    fall back to top-1 of the real experts (FORCE_TOP1).
+
+    Args:
+        config (TransformerConfig): Megatron-Core transformer configuration.
+        pg_collection (ProcessGroupCollection, optional): Process groups.
+        is_mtp_layer (bool): MTP-layer flag.
+        num_null (int): Number of null expert slots `m`.
+            Env: ``ADAMOE_NUM_NULL`` (default 16).
+        topk_aug (int): Augmented top-k (k+m'). Env: ``ADAMOE_TOPK``
+            (default 3, matched with num_null=16 to give expected real-K=2).
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        num_null: int = 16,
+        topk_aug: int = 3,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
+
+        self.num_real = config.num_moe_experts
+        self.num_null = int(os.environ.get("ADAMOE_NUM_NULL", str(num_null)))
+        self.topk_aug = int(os.environ.get("ADAMOE_TOPK", str(topk_aug)))
+
+        # Replace the parent's [N, d] weight with augmented [N+m, d].
+        del self.weight
+        self.weight = torch.nn.Parameter(
+            torch.empty(
+                (self.num_real + self.num_null, config.hidden_size),
+                dtype=torch.float32,
+            )
+        )
+        if config.perform_initialization:
+            config.init_method(self.weight)
+        self.weight.data = self.weight.data.to(dtype=config.params_dtype)
+        setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
+
+        print(
+            f"[AdaMoERouter] initialized: {self.num_real} real + {self.num_null} null "
+            f"experts, top-{self.topk_aug}, expected real-K = "
+            f"{self.topk_aug * self.num_real / (self.num_real + self.num_null):.2f}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        original_shape = input.shape
+        input_2d = input.view(-1, original_shape[-1])
+        num_tokens = input_2d.shape[0]
+
+        # Augmented logits over N+m experts.
+        logits = self.gating(input_2d).float()  # [num_tokens, N+m]
+        full_probs = F.softmax(logits, dim=-1)
+
+        # Top-(k+m'): selects k_aug indices per token. Probs from softmax;
+        # indices may include null slots.
+        topk_vals, topk_idx = full_probs.topk(self.topk_aug, dim=-1)  # [num_tokens, k_aug]
+
+        # Mask null picks (indices ≥ num_real).
+        is_real = (topk_idx < self.num_real)  # [num_tokens, k_aug]
+        # Number of REAL experts this token actually routed to.
+        K_real = is_real.float().sum(dim=1)  # [num_tokens]
+
+        # Build full routing_map / weights tensor over [N+m], mask nulls, then
+        # take real columns.
+        full_routing = torch.zeros_like(full_probs)
+        # Scatter real probs into their positions; null positions stay 0.
+        full_routing.scatter_(1, topk_idx, topk_vals * is_real.float())
+        weights_real = full_routing[:, : self.num_real]  # [num_tokens, N]
+        routing_map = (weights_real > 0)
+
+        # FORCE_TOP1 fallback: tokens whose entire top-(k+m') was nulls.
+        no_expert_mask = (K_real == 0)
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")) and no_expert_mask.any():
+            real_logits = logits[:, : self.num_real]
+            top1_real_idx = real_logits.argmax(dim=1)  # [num_tokens]
+            top1_real_prob = F.softmax(real_logits, dim=-1).gather(
+                1, top1_real_idx.unsqueeze(1)
+            ).squeeze(1)  # [num_tokens]
+            # Set the top-1 real expert as the only routed pick for these tokens.
+            mask = no_expert_mask.unsqueeze(1)  # [num_tokens, 1]
+            scatter_vals = torch.zeros_like(weights_real)
+            scatter_vals.scatter_(1, top1_real_idx.unsqueeze(1), top1_real_prob.unsqueeze(1))
+            weights_real = torch.where(mask, scatter_vals, weights_real)
+            routing_map = (weights_real > 0)
+            K_real = routing_map.float().sum(dim=1)
+
+        # Renormalize over real picks so each token's probs sum to 1.
+        probs = (
+            weights_real / weights_real.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        ).to(input.dtype)
+
+        # K diagnostics.
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K_real.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K_real.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K_real.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K_real.detach().float().std() + _EPS, layer_number, num_layers,
+                reduce_op="replace",
+            )
+            k_int = K_real.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_real + 1)
+            for i in range(1, self.num_real + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
+                    layer_number, num_layers, reduce_op="replace",
+                )
+
+            null_pick_frac = (~is_real).float().mean()
+            save_to_aux_losses_tracker(
+                "adamoe_null_pick_frac", null_pick_frac + _EPS,
+                layer_number, num_layers, reduce_op="replace",
+            )
+
+            if _sweep_diag_should_log(self.layer_number):
+                with torch.no_grad():
+                    ec = routing_map.float().sum(dim=0)
+                    ec_mean = ec.mean().clamp_min(1e-6)
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="adamoe",
+                        k_mean=K_real.float().mean().item(),
+                        k_std=K_real.float().std().item(),
+                        k_max=K_real.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec.max() / ec_mean).item(),
+                        load_min_over_mean=(ec.min() / ec_mean).item(),
+                        dead_count=(ec < 0.1 * ec_mean).sum().item(),
+                        threshold_mean=null_pick_frac.item(),
+                        threshold_abs_max=0.0,
+                        target_K=self.topk_aug * self.num_real / (self.num_real + self.num_null),
+                        num_experts=self.num_real,
+                        update_mode=f"m{self.num_null}_k{self.topk_aug}",
+                    )
+
+        # Optional load-balance aux loss (standard form, over the N+m space).
+        if self.training and torch.is_grad_enabled():
+            aux_loss_coeff = self.config.moe_aux_loss_coeff or 0.0
+            if aux_loss_coeff > 0:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+                layer_number = self.layer_number
+                if self.is_mtp_layer:
+                    layer_number = self.layer_number + self.config.num_layers
+                # Standard switch-style: f_i * P_i, summed over experts.
+                # Augmented over N+m so null experts get a balance signal too.
+                pick_mask = torch.zeros_like(full_probs)
+                pick_mask.scatter_(1, topk_idx, 1.0)
+                f_aug = pick_mask.float().mean(dim=0)  # [N+m]
+                P_aug = full_probs.mean(dim=0)         # [N+m]
+                l_aux = (
+                    aux_loss_coeff
+                    * (f_aug * P_aug).sum()
+                    * (self.num_real + self.num_null)
+                )
+                save_to_aux_losses_tracker(
+                    "load_balancing_loss",
+                    l_aux.detach() / aux_loss_coeff,
+                    layer_number,
+                    num_layers,
+                    reduce_group=self.tp_cp_group,
+                )
+                probs = MoEAuxLossAutoScaler.apply(probs, l_aux.to(probs.dtype))
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Not used — handled entirely in forward()."""
+        raise NotImplementedError("AdaMoERouter uses forward() directly, not routing().")
+
+
+# ─── Dynamic Top-P (PI-controlled cumulative threshold) ──────────────────────
+#
+# Subclass of TopPRouter: the static ``top_p`` becomes a state variable
+# updated by a Proportional-Integral controller targeting a desired
+# average-K (instead of a fixed cumulative-confidence threshold).
+#
+# Fixes the failure modes we saw with static p=0.5:
+#   - Initial collapse to K=1 (highest score alone covers p=0.5).
+#   - Eventual runaway to K=9 (scores collapsed under aux-loss pressure).
+#
+# Reference: Sparsity-Controllable Dynamic Top-p MoE, arXiv:2512.13996 (2025).
+
+class DynamicTopPRouter(TopPRouter):
+    """Top-P router with PI-controlled cumulative threshold.
+
+    Maintains ``self.top_p`` as a buffer; at the end of each training forward
+    measures actual average-K and applies a PI update toward the target.
+
+    Args:
+        config: Megatron-Core transformer configuration.
+        pg_collection (optional): Process groups.
+        is_mtp_layer (bool): MTP-layer flag.
+        target_K (float, optional): Desired average K. Env ``DTOPP_TARGET_K``.
+        kp (float): Proportional gain. Env ``DTOPP_KP``.
+        ki (float): Integral gain.    Env ``DTOPP_KI``.
+        p_init (float): Initial p value. Env ``DTOPP_P_INIT``.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        target_K: Optional[float] = None,
+        kp: float = 0.05,
+        ki: float = 0.005,
+        p_init: float = 1.0,
+    ) -> None:
+        # Initialize parent with the initial p value.
+        os.environ.setdefault("TOPP_THRESHOLD", str(os.environ.get("DTOPP_P_INIT", str(p_init))))
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+
+        self.target_K = float(os.environ.get(
+            "DTOPP_TARGET_K",
+            str(target_K if target_K is not None else
+                getattr(config, 'moe_topany_target_k', 2.0)),
+        ))
+        self.kp = float(os.environ.get("DTOPP_KP", str(kp)))
+        self.ki = float(os.environ.get("DTOPP_KI", str(ki)))
+        self.p_min = float(os.environ.get("DTOPP_P_MIN", "0.05"))
+        self.p_max = float(os.environ.get("DTOPP_P_MAX", "8.0"))
+
+        # State for PI controller. Stored as Python floats — small scalars,
+        # no gradient, no need for buffers.
+        self._error_integral = 0.0
+
+        print(
+            f"[DynamicTopPRouter] init p={self.top_p}, target_K={self.target_K}, "
+            f"kp={self.kp}, ki={self.ki}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Run the parent forward at the current (frozen) p.
+        probs, routing_map = super().forward(input, padding_mask)
+
+        # PI update for next step. p increases when K too low, decreases when
+        # K too high. Sign convention: error = target_K - measured_K.
+        if self.training:
+            with torch.no_grad():
+                current_K = routing_map.float().sum(dim=1).mean().item()
+                error = self.target_K - current_K
+                self._error_integral += error
+                new_p = self.top_p + self.kp * error + self.ki * self._error_integral
+                new_p = max(self.p_min, min(self.p_max, new_p))
+                # Anti-windup on integral when clamped.
+                if new_p == self.p_min or new_p == self.p_max:
+                    self._error_integral -= error
+                self.top_p = new_p
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Not used — handled entirely in forward()."""
+        raise NotImplementedError("DynamicTopPRouter uses forward() directly, not routing().")
 
