@@ -1861,8 +1861,14 @@ class ReMoERouter(Router):
                 f = routing_map.float().mean(dim=0)  # [num_experts]
 
             # Load-weighted L1: λ · (1/T) · Σ_t Σ_e f_e · gate_{t,e}
-            # f detached; gate is the live tensor that carries gradient.
-            l1 = self._fp32_lam * (f.unsqueeze(0) * gate).sum() / max(num_tokens, 1)
+            # λ extracted as a Python float via .item() — using .detach()
+            # alone shares the underlying storage and version counter with
+            # `_fp32_lam`, so the next step's in-place `*=` bumps the version
+            # and breaks the prior backward (manifests as "version is at N;
+            # expected M" under gradient accumulation, where multiple
+            # forwards stack before any backward executes).
+            lam_val = float(self._fp32_lam.item())
+            l1 = lam_val * (f.unsqueeze(0) * gate).sum() / max(num_tokens, 1)
 
             if _sweep_diag_should_log(self.layer_number):
                 with torch.no_grad():
