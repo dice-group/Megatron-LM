@@ -1171,3 +1171,504 @@ class LossFreeSigmoidRouter(Router):
         """Not used — handled entirely in forward()."""
         raise NotImplementedError("LossFreeSigmoidRouter uses forward() directly, not routing().")
 
+
+# ─── Expert Threshold Router (kth-largest EMA) ───────────────────────────────
+#
+# Different load-balancing controller than LossFree*: instead of a count-error
+# feedback loop ("expert took too many tokens → push bias down"), maintain a
+# per-expert threshold via EMA of the kth-largest score that arrives at each
+# expert. With k = target_K · num_tokens / num_experts, the threshold converges
+# to the order-statistic that yields exactly target_K activations per token in
+# expectation. Tracking the score distribution directly avoids the overshoot
+# and oscillation seen when a count-based controller chases a moving target
+# while the underlying gating weights are still drifting.
+#
+# Equivalent to Expert-Choice routing over an infinitely large batch, which
+# restores causality (no batch-wise ranking required at any step).
+
+class ETRouter(Router):
+    """Expert Threshold router with kth-largest EMA balancing.
+
+    Linear(d, E) → sigmoid → STE(score > c_e), where c_e is a per-expert
+    threshold buffer updated outside autograd as
+    ``c_e ← β·c_e + (1-β)·kth-largest(score_e)``,
+    with k chosen so that uniform routing yields exactly ``target_K``
+    activations per token.
+
+    Args:
+        config (TransformerConfig): Megatron-Core transformer configuration.
+        pg_collection (ProcessGroupCollection, optional): Process groups for MoE ops.
+        is_mtp_layer (bool): Whether this router belongs to an MTP layer.
+        target_K (float, optional): Desired average activations per token.
+        ema_beta (float): EMA decay for threshold tracking. Env override:
+            ``ET_EMA_BETA`` (default 0.99).
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        target_K: Optional[float] = None,
+        ema_beta: float = 0.99,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
+
+        num_experts = config.num_moe_experts
+
+        self.target_K = target_K if target_K is not None else getattr(
+            config, 'moe_topany_target_k', 2.0
+        )
+        self.ema_beta = float(os.environ.get("ET_EMA_BETA", str(ema_beta)))
+
+        # Init at the score quantile that yields target_K acceptance under a
+        # uniform sigmoid distribution: with E experts and target_K kept,
+        # threshold = 1 - target_K/E in [0,1].
+        init_t = max(0.0, min(1.0, 1.0 - self.target_K / num_experts))
+        self.register_buffer("et_threshold", torch.full((num_experts,), init_t))
+        self._fp32_threshold = None
+
+        print(
+            f"[ETRouter] initialized: {num_experts} experts, "
+            f"hidden_size={config.hidden_size}, target_K={self.target_K}, "
+            f"ema_beta={self.ema_beta}, init_threshold={init_t:.4f}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        original_shape = input.shape
+        input_2d = input.view(-1, original_shape[-1])
+        num_tokens = input_2d.shape[0]
+
+        logits = self.gating(input_2d).float()
+        raw_logits = torch.sigmoid(logits)
+
+        if self._fp32_threshold is None or self._fp32_threshold.device != input.device:
+            self._fp32_threshold = self.et_threshold.clone().float().to(input.device)
+
+        scores = raw_logits - self._fp32_threshold.detach().unsqueeze(0)
+        gates = GAMoEGateSTEBackward.apply(scores)
+
+        # FORCE_TOP1 fallback (consistent with other Top-Any variants).
+        exp_counts_per_token = gates.sum(dim=1)
+        no_expert_mask = (exp_counts_per_token == 0)
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")):
+            top1_idx = logits.argmax(dim=1)
+            gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
+            K = exp_counts_per_token + no_expert_mask.float()
+        else:
+            K = exp_counts_per_token
+
+        # K + threshold + load diagnostics
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K.detach().float().std() + _EPS, layer_number, num_layers,
+                reduce_op="replace",
+            )
+            k_int = K.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_experts + 1)
+            for i in range(1, self.num_experts + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
+                    layer_number, num_layers, reduce_op="replace",
+                )
+
+            t = self._fp32_threshold.detach()
+            save_to_aux_losses_tracker(
+                "threshold_mean", t.mean() + _EPS, layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "threshold_abs_max", t.abs().max() + _EPS, layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "no_expert_fallback_frac",
+                no_expert_mask.float().mean() + _EPS, layer_number, num_layers, reduce_op="replace",
+            )
+            ec = gates.sum(dim=0).detach().float()
+            ec_mean = ec.mean().clamp_min(1e-6)
+            save_to_aux_losses_tracker(
+                "expert_load_max_over_mean", ec.max() / ec_mean + _EPS,
+                layer_number, num_layers, reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "expert_load_min_over_mean", ec.min() / ec_mean + _EPS,
+                layer_number, num_layers, reduce_op="replace",
+            )
+
+        # EMA threshold update (outside autograd)
+        if self.training:
+            log_metrics = torch.is_grad_enabled()
+            with torch.no_grad():
+                # k = expected tokens per expert under target_K balanced routing.
+                k = max(1, min(num_tokens,
+                               int(round(num_tokens * self.target_K / self.num_experts))))
+                # kth-largest sigmoid score per expert = smallest of the top-k.
+                topk_vals, _ = raw_logits.detach().topk(k, dim=0)
+                kth_largest = topk_vals[-1]  # [num_experts]
+
+                # Average across TP/DP/CP for cross-rank threshold consistency.
+                group = self.tp_dp_cp_group
+                world_size = (
+                    torch.distributed.get_world_size(group)
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        and group is not None
+                    )
+                    else 1
+                )
+                if world_size > 1:
+                    torch.distributed.all_reduce(kth_largest, group=group)
+                    kth_largest /= world_size
+
+                self._fp32_threshold.mul_(self.ema_beta).add_(
+                    kth_largest, alpha=1.0 - self.ema_beta
+                )
+                self._fp32_threshold.clamp_(0.0, 1.0)
+                self.et_threshold.copy_(self._fp32_threshold)
+
+                if log_metrics and _sweep_diag_should_log(self.layer_number):
+                    ec = gates.sum(dim=0).float()
+                    ec_mean = ec.mean().clamp_min(1e-6)
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="et",
+                        k_mean=K.float().mean().item(),
+                        k_std=K.float().std().item(),
+                        k_max=K.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec.max() / ec_mean).item(),
+                        load_min_over_mean=(ec.min() / ec_mean).item(),
+                        dead_count=(ec < 0.1 * ec_mean).sum().item(),
+                        threshold_mean=self._fp32_threshold.mean().item(),
+                        threshold_abs_max=self._fp32_threshold.abs().max().item(),
+                        target_K=self.target_K,
+                        update_rate=self.ema_beta,
+                        update_mode="ema_kth",
+                        num_experts=self.num_experts,
+                    )
+
+        routing_map = gates.bool()
+        soft_weights = raw_logits * gates
+        probs = (
+            soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        ).to(input.dtype)
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Not used — handled entirely in forward()."""
+        raise NotImplementedError("ETRouter uses forward() directly, not routing().")
+
+
+# ─── Top-P (Confidence) Router ───────────────────────────────────────────────
+#
+# Variable K via cumulative-confidence thresholding. Per token, sort sigmoid
+# scores descending and activate experts until their cumulative sum first
+# reaches ``top_p``. K is implicit: confident tokens get K=1, ambiguous tokens
+# pull in more experts. No threshold buffer to update; balance is encouraged
+# via the standard load-balance aux loss + optional entropy-min regularizer.
+
+class TopPRouter(Router):
+    """Top-P confidence-based variable-K router.
+
+    Linear(d, E) → sigmoid → cumulative-sum → STE-thresholded selection.
+    Number of activated experts depends on token-level routing confidence.
+
+    Args:
+        config (TransformerConfig): Megatron-Core transformer configuration.
+        pg_collection (ProcessGroupCollection, optional): Process groups for MoE ops.
+        is_mtp_layer (bool): Whether this router belongs to an MTP layer.
+        top_p (float, optional): Cumulative confidence threshold. Env override:
+            ``TOPP_THRESHOLD`` (default 0.5).
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        top_p: Optional[float] = None,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+            self.bias = None
+
+        default_p = top_p if top_p is not None else 0.5
+        self.top_p = float(os.environ.get("TOPP_THRESHOLD", str(default_p)))
+
+        print(
+            f"[TopPRouter] initialized: {self.num_experts} experts, "
+            f"hidden_size={config.hidden_size}, top_p={self.top_p}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        original_shape = input.shape
+        input_2d = input.view(-1, original_shape[-1])
+        num_tokens = input_2d.shape[0]
+
+        logits = self.gating(input_2d).float()
+        raw_logits = torch.sigmoid(logits)  # [N, E]
+
+        # Sort descending, keep experts whose cumulative-confidence pre-sum
+        # is still below top_p (i.e., include the one that crosses p).
+        sorted_logits, sorted_idx = raw_logits.detach().sort(dim=1, descending=True)
+        cumsum = sorted_logits.cumsum(dim=1)
+        prev_cum = torch.cat(
+            [torch.zeros_like(cumsum[:, :1]), cumsum[:, :-1]], dim=1
+        )
+        keep_sorted = (prev_cum < self.top_p)  # [N, E] bool
+
+        keep = torch.zeros_like(keep_sorted)
+        keep.scatter_(1, sorted_idx, keep_sorted)
+
+        # STE: per-token cutoff = smallest kept sigmoid score; gradient flows
+        # through `raw_logits - cutoff` so the router can learn to push scores
+        # above/below the dynamic per-token boundary.
+        num_kept = keep_sorted.float().sum(dim=1).long().clamp(min=1)  # [N]
+        last_kept_pos = (num_kept - 1).clamp(max=self.num_experts - 1)
+        cutoff_score = sorted_logits.gather(1, last_kept_pos.unsqueeze(1))  # [N,1]
+        scores = raw_logits - cutoff_score
+        # Forward gates match the sorted-cumsum decision exactly (continuous
+        # sigmoid scores → ties are negligible). Backward = identity through scores.
+        gates = GAMoEGateSTEBackward.apply(scores)
+
+        # FORCE_TOP1 fallback (rare here since the first-ranked expert is
+        # always kept by construction, but kept for parity with siblings).
+        exp_counts_per_token = gates.sum(dim=1)
+        no_expert_mask = (exp_counts_per_token == 0)
+        if int(os.environ.get("TOPANY_FORCE_TOP1", "1")):
+            top1_idx = logits.argmax(dim=1)
+            gates.scatter_add_(1, top1_idx.unsqueeze(1), no_expert_mask.float().unsqueeze(1))
+            K = exp_counts_per_token + no_expert_mask.float()
+        else:
+            K = exp_counts_per_token
+
+        # K stats
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            layer_number = self.layer_number
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+
+            save_to_aux_losses_tracker(
+                "topany_k_mean", K.detach().float().mean(), layer_number, num_layers,
+                reduce_op="replace",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_min", K.detach().min().float(), layer_number, num_layers,
+                reduce_op="min",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_max", K.detach().max().float(), layer_number, num_layers,
+                reduce_op="max",
+            )
+            save_to_aux_losses_tracker(
+                "topany_k_std", K.detach().float().std() + _EPS, layer_number, num_layers,
+                reduce_op="replace",
+            )
+            k_int = K.detach().long()
+            counts = torch.bincount(k_int, minlength=self.num_experts + 1)
+            for i in range(1, self.num_experts + 1):
+                save_to_aux_losses_tracker(
+                    f"topany_k_dist_{i}", counts[i].float() / num_tokens + _EPS,
+                    layer_number, num_layers, reduce_op="replace",
+                )
+
+        routing_map = gates.bool()
+        soft_weights = raw_logits * gates
+        probs = (
+            soft_weights / soft_weights.sum(dim=1, keepdim=True).clamp_min(1e-9)
+        ).to(input.dtype)
+
+        # Aux losses: load balance (always useful here since there's no
+        # per-expert threshold) + optional entropy-min to encourage decisive
+        # confidence distributions over time.
+        if self.training and torch.is_grad_enabled():
+            aux_loss_coeff = self.config.moe_aux_loss_coeff or 0.0
+            entropy_coeff = float(os.environ.get("TOPP_ENTROPY_COEFF", "0"))
+
+            if _sweep_diag_should_log(self.layer_number):
+                with torch.no_grad():
+                    ec_diag = gates.sum(dim=0).float()
+                    ec_mean_diag = ec_diag.mean().clamp_min(1e-6)
+                    non_zero_count_diag = (K > 0).sum().clamp(min=1).float()
+                    me_diag = ec_diag / non_zero_count_diag
+                    l_lb_raw = (me_diag.mul(me_diag).mean() *
+                                self.num_experts * self.num_experts).item()
+                    logit_diag = logits.detach().float()
+                    _sweep_diag_log(
+                        self.layer_number,
+                        routing_type="topp",
+                        k_mean=K.float().mean().item(),
+                        k_std=K.float().std().item(),
+                        k_max=K.float().max().item(),
+                        no_expert_frac=no_expert_mask.float().mean().item(),
+                        load_max_over_mean=(ec_diag.max() / ec_mean_diag).item(),
+                        load_min_over_mean=(ec_diag.min() / ec_mean_diag).item(),
+                        dead_count=(ec_diag < 0.1 * ec_mean_diag).sum().item(),
+                        threshold_mean=logit_diag.mean().item(),
+                        threshold_abs_max=logit_diag.abs().max().item(),
+                        aux_loss_lb=l_lb_raw,
+                        target_K=self.top_p,
+                        num_experts=self.num_experts,
+                    )
+
+            if aux_loss_coeff > 0 or entropy_coeff > 0:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+                layer_number = self.layer_number
+                if self.is_mtp_layer:
+                    layer_number = self.layer_number + self.config.num_layers
+
+                total_aux = torch.zeros((), device=probs.device, dtype=probs.dtype)
+
+                if aux_loss_coeff > 0:
+                    exp_counts = gates.sum(dim=0)
+                    non_zero_count = (K > 0).sum().clamp(min=1).float()
+                    me = exp_counts / non_zero_count
+                    l_aux = (
+                        aux_loss_coeff
+                        * torch.mean(me * me)
+                        * self.num_experts
+                        * self.num_experts
+                    )
+                    total_aux = total_aux + l_aux.to(probs.dtype)
+                    save_to_aux_losses_tracker(
+                        "load_balancing_loss",
+                        l_aux.detach() / aux_loss_coeff,
+                        layer_number,
+                        num_layers,
+                        reduce_group=self.tp_cp_group,
+                    )
+
+                if entropy_coeff > 0:
+                    # H(p) per token over the sigmoid-normalized distribution;
+                    # minimizing H pushes the router toward decisive choices.
+                    p_norm = raw_logits / raw_logits.sum(dim=1, keepdim=True).clamp_min(1e-9)
+                    ent = -(p_norm * (p_norm.clamp_min(1e-9)).log()).sum(dim=1).mean()
+                    l_ent = entropy_coeff * ent
+                    total_aux = total_aux + l_ent.to(probs.dtype)
+                    save_to_aux_losses_tracker(
+                        "router_entropy",
+                        ent.detach() + _EPS,
+                        layer_number,
+                        num_layers,
+                        reduce_op="replace",
+                    )
+
+                probs = MoEAuxLossAutoScaler.apply(probs, total_aux)
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor):
+        """Not used — handled entirely in forward()."""
+        raise NotImplementedError("TopPRouter uses forward() directly, not routing().")
+
+
+# ─── K-target annealing wrapper around LossFreeSigmoidRouter ─────────────────
+#
+# Same machinery as LossFreeSigmoidRouter, but ``target_K`` is cosine-annealed
+# from ``TOPANY_K_ANNEAL_START`` → ``TOPANY_K_ANNEAL_END`` between
+# ``TOPANY_K_ANNEAL_START_STEP`` and ``TOPANY_K_ANNEAL_END_STEP``. Step counter
+# increments per training-forward call, so the schedule is in micro-batches —
+# multiply by GRAD_ACCUM_STEPS if you want to think in optimizer steps.
+#
+# Motivation (Sigma-MoE-Tiny progressive sparsification): early layers can't
+# differentiate representations well enough to support sparse routing, so
+# starting at higher K and annealing down stabilizes loss and lets specialized
+# experts emerge organically before being squeezed.
+
+class LossFreeSigmoidAnnealRouter(LossFreeSigmoidRouter):
+    """LossFreeSigmoidRouter with cosine K-target annealing."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        target_K: Optional[float] = None,
+        update_rate: Optional[float] = None,
+        threshold_update_mode: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            target_K=target_K,
+            update_rate=update_rate,
+            threshold_update_mode=threshold_update_mode,
+        )
+        self._anneal_start_K = float(
+            os.environ.get("TOPANY_K_ANNEAL_START", str(self.target_K))
+        )
+        self._anneal_end_K = float(
+            os.environ.get("TOPANY_K_ANNEAL_END", str(self.target_K))
+        )
+        self._anneal_start_step = int(os.environ.get("TOPANY_K_ANNEAL_START_STEP", "0"))
+        self._anneal_end_step = int(os.environ.get("TOPANY_K_ANNEAL_END_STEP", "0"))
+        self._fwd_step = 0
+
+        print(
+            f"[LossFreeSigmoidAnnealRouter] anneal K: "
+            f"{self._anneal_start_K} → {self._anneal_end_K} "
+            f"over steps [{self._anneal_start_step}, {self._anneal_end_step}]"
+        )
+
+    def _current_target_K(self) -> float:
+        if self._anneal_end_step <= self._anneal_start_step:
+            return self._anneal_start_K
+        if self._fwd_step <= self._anneal_start_step:
+            return self._anneal_start_K
+        if self._fwd_step >= self._anneal_end_step:
+            return self._anneal_end_K
+        progress = (self._fwd_step - self._anneal_start_step) / (
+            self._anneal_end_step - self._anneal_start_step
+        )
+        return self._anneal_end_K + 0.5 * (self._anneal_start_K - self._anneal_end_K) * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.training:
+            self._fwd_step += 1
+            self.target_K = self._current_target_K()
+        return super().forward(input, padding_mask)
+
